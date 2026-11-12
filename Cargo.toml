@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+mpvlink-proto = { path = "crates/proto" }
+mpvlink-rtc = { path = "crates/rtc" }
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+openh264 = "0.9"
+rtc = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio-tungstenite = "0.30"
+webrtc = "0.21"
+
+[profile.release]
+panic = "abort"

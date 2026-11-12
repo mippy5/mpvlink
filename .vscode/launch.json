@@ -1,0 +1,45 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Start mpv with nothing to play: the plugin opens the join menu right away.
+      "name": "Debug mpv plugin (join menu)",
+      "type": "lldb",
+      "request": "launch",
+      "preLaunchTask": "build plugin (debug)",
+      "program": "/opt/homebrew/bin/mpv",
+      "args": [
+        "--script=${workspaceFolder}/target/debug/mpvlink.so",
+        "--idle=yes"
+      ],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["rust"],
+      "console": "internalConsole"
+    },
+    {
+      // Launch mpv under LLDB with the debug build of the plugin loaded.
+      // Breakpoints in src/*.rs bind once mpv loads the plugin.
+      "name": "Debug mpv plugin (play media)",
+      "type": "lldb",
+      "request": "launch",
+      "preLaunchTask": "build plugin (debug)",
+      "program": "/opt/homebrew/bin/mpv",
+      "args": [
+        "--script=${workspaceFolder}/target/debug/mpvlink.so",
+        "--keep-open=yes",
+        "${input:media}"
+      ],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["rust"],
+      "console": "internalConsole"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "media",
+      "type": "promptString",
+      "description": "File or URL to play (the default is a generated test video)",
+      "default": "av://lavfi:testsrc=duration=60"
+    }
+  ]
+}

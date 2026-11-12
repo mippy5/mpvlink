@@ -1,0 +1,17 @@
+[package]
+name = "mpvlink-rtc"
+description = "WebRTC plumbing shared by the mpvlink plugin and sender"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mpvlink-proto.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+rtc.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+webrtc.workspace = true

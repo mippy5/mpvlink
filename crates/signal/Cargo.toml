@@ -1,0 +1,13 @@
+[package]
+name = "mpvlink-signal"
+description = "mpvlink signaling server: matches peers by room code and relays SDP"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mpvlink-proto.workspace = true
+anyhow.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
