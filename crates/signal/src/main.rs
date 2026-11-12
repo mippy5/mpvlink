@@ -10,8 +10,7 @@
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use mpvlink_proto::{
-    ClientMsg, MAX_RESUME_TOKEN_LEN, PeerId, PeerInfo, RESUME_GRACE_SECS, Role, ServerMsg, normalize_name,
-    normalize_room,
+    ClientMsg, MAX_RESUME_TOKEN_LEN, PeerId, PeerInfo, RESUME_GRACE_SECS, ServerMsg, normalize_name, normalize_room,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -28,7 +27,7 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// Clients ping every 30 s. A connection silent for this long is presumed dead
 /// (e.g. the peer lost power or network, so no TCP reset ever arrives) and is
-/// dropped, so a vanished publisher doesn't block its room.
+/// dropped, so a vanished peer doesn't linger in its room.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 type Outbox = mpsc::UnboundedSender<ServerMsg>;
@@ -100,7 +99,7 @@ impl State {
     fn join(
         &mut self,
         room: &str,
-        (name, role, resume_token): (String, Role, Option<String>),
+        (name, streaming, resume_token): (String, bool, Option<String>),
         conn: ConnId,
         outbox: Outbox,
     ) -> Result<Joined, String> {
@@ -126,10 +125,7 @@ impl State {
             return Ok(Joined { id, resumed: true });
         }
 
-        if role == Role::Publisher && members.values().any(|m| m.info.role == Role::Publisher) {
-            return Err("This room already has someone streaming.".into());
-        }
-        let info = PeerInfo { id: new_id, name, role };
+        let info = PeerInfo { id: new_id, name, streaming };
         let _ = outbox.send(ServerMsg::Welcome { you: new_id, peers: others(members, new_id), resumed: false });
         for m in members.values_mut() {
             m.send(ServerMsg::PeerJoined { peer: info.clone() });
@@ -138,15 +134,29 @@ impl State {
         Ok(Joined { id: new_id, resumed: false })
     }
 
-    /// A connection closed. Peers that can resume are held; others leave now.
-    fn disconnect(&mut self, room: &str, id: PeerId, conn: ConnId) -> Departure {
+    /// A member started or stopped streaming: tell everyone else. Returns
+    /// false if nothing changed.
+    fn set_streaming(&mut self, room: &str, id: PeerId, streaming: bool) -> bool {
+        let Some(members) = self.rooms.get_mut(room) else { return false };
+        let Some(member) = members.get_mut(&id).filter(|m| m.info.streaming != streaming) else { return false };
+        member.info.streaming = streaming;
+        let peer = member.info.clone();
+        for m in members.values_mut().filter(|m| m.info.id != id) {
+            m.send(ServerMsg::PeerUpdated { peer: peer.clone() });
+        }
+        true
+    }
+
+    /// A connection closed. Peers that can resume are held, unless they said
+    /// they're `leaving`; others leave now.
+    fn disconnect(&mut self, room: &str, id: PeerId, conn: ConnId, leaving: bool) -> Departure {
         let Some(member) = self.rooms.get_mut(room).and_then(|m| m.get_mut(&id)) else {
             return Departure::Superseded;
         };
         if member.conn != conn {
             return Departure::Superseded;
         }
-        if member.resume_token.is_some() {
+        if member.resume_token.is_some() && !leaving {
             member.link = Link::Away(Vec::new());
             return Departure::Away;
         }
@@ -254,6 +264,8 @@ async fn handle(stream: TcpStream, addr: SocketAddr, conn: ConnId, state: Arc<Mu
 
     // (room, our peer id) once joined.
     let mut joined: Option<(String, PeerId)> = None;
+    // The client said it's leaving on purpose: don't hold its place.
+    let mut leaving = false;
     let tag = |joined: &Option<(String, PeerId)>| match joined {
         Some((_, id)) => format!("[{id}] {addr}"),
         None => format!("[conn {conn}] {addr}"),
@@ -286,7 +298,7 @@ async fn handle(stream: TcpStream, addr: SocketAddr, conn: ConnId, state: Arc<Mu
             }
         };
         match (msg, &joined) {
-            (ClientMsg::Join { room, name, role, resume }, None) => {
+            (ClientMsg::Join { room, name, streaming, resume }, None) => {
                 let (Some(room), Some(name)) = (normalize_room(&room), normalize_name(&name)) else {
                     let _ = outbox.send(ServerMsg::Error { message: "Invalid room code or name.".into() });
                     break;
@@ -295,11 +307,12 @@ async fn handle(stream: TcpStream, addr: SocketAddr, conn: ConnId, state: Arc<Mu
                     let _ = outbox.send(ServerMsg::Error { message: "Invalid resume token.".into() });
                     break;
                 }
-                let result = state.lock().unwrap().join(&room, (name.clone(), role, resume), conn, outbox.clone());
+                let result = state.lock().unwrap().join(&room, (name.clone(), streaming, resume), conn, outbox.clone());
                 match result {
                     Ok(Joined { id, resumed }) => {
                         let verb = if resumed { "resumed in" } else { "joined" };
-                        println!("[{id}] {addr}: {name} {verb} {room} as {role:?}");
+                        let live = if streaming { " (streaming)" } else { "" };
+                        println!("[{id}] {addr}: {name} {verb} {room}{live}");
                         joined = Some((room, id));
                     }
                     Err(message) => {
@@ -313,11 +326,21 @@ async fn handle(stream: TcpStream, addr: SocketAddr, conn: ConnId, state: Arc<Mu
                     let _ = outbox.send(ServerMsg::PeerLeft { id: to });
                 }
             }
+            (ClientMsg::Leave, _) => {
+                leaving = true;
+                break;
+            }
+            (ClientMsg::SetStreaming { streaming }, Some((room, id))) => {
+                if state.lock().unwrap().set_streaming(room, *id, streaming) {
+                    let what = if streaming { "started" } else { "stopped" };
+                    println!("[{id}] {addr}: {what} streaming in {room}");
+                }
+            }
             (ClientMsg::Join { .. }, Some(_)) => {
                 let _ = outbox.send(ServerMsg::Error { message: "Already joined.".into() });
                 break;
             }
-            (ClientMsg::Signal { .. }, None) => {
+            (ClientMsg::Signal { .. } | ClientMsg::SetStreaming { .. }, None) => {
                 let _ = outbox.send(ServerMsg::Error { message: "Join a room first.".into() });
                 break;
             }
@@ -325,7 +348,7 @@ async fn handle(stream: TcpStream, addr: SocketAddr, conn: ConnId, state: Arc<Mu
     }
 
     if let Some((room, id)) = joined {
-        let departure = state.lock().unwrap().disconnect(&room, id, conn);
+        let departure = state.lock().unwrap().disconnect(&room, id, conn, leaving);
         match departure {
             Departure::Left => println!("[{id}] {addr}: left {room}"),
             Departure::Superseded => {}
@@ -369,33 +392,50 @@ mod tests {
         }
     }
 
-    fn join(s: &mut State, c: &Client, id: PeerId, role: Role, token: Option<&str>) -> Result<Joined, String> {
-        s.join("ROOM", (format!("p{id}"), role, token.map(str::to_string)), id, c.tx.clone())
+    fn join(s: &mut State, c: &Client, id: PeerId, streaming: bool, token: Option<&str>) -> Result<Joined, String> {
+        s.join("ROOM", (format!("p{id}"), streaming, token.map(str::to_string)), id, c.tx.clone())
     }
 
-    fn info(id: PeerId, role: Role) -> PeerInfo {
-        PeerInfo { id, name: format!("p{id}"), role }
+    fn info(id: PeerId, streaming: bool) -> PeerInfo {
+        PeerInfo { id, name: format!("p{id}"), streaming }
     }
 
     #[test]
-    fn rooms_track_members_and_reject_second_publisher() {
+    fn rooms_track_members_and_streaming() {
         let mut s = State::default();
-        let (mut p, mut v, p2) = (client(), client(), client());
+        let (mut p, mut v, mut p2) = (client(), client(), client());
 
-        join(&mut s, &p, 1, Role::Publisher, None).unwrap();
+        join(&mut s, &p, 1, true, None).unwrap();
         assert_eq!(p.next(), ServerMsg::Welcome { you: 1, peers: vec![], resumed: false });
-        join(&mut s, &v, 2, Role::Viewer, None).unwrap();
-        assert_eq!(v.next(), ServerMsg::Welcome { you: 2, peers: vec![info(1, Role::Publisher)], resumed: false });
-        assert_eq!(p.next(), ServerMsg::PeerJoined { peer: info(2, Role::Viewer) });
-        assert!(join(&mut s, &p2, 3, Role::Publisher, None).is_err());
+        join(&mut s, &v, 2, false, None).unwrap();
+        assert_eq!(v.next(), ServerMsg::Welcome { you: 2, peers: vec![info(1, true)], resumed: false });
+        assert_eq!(p.next(), ServerMsg::PeerJoined { peer: info(2, false) });
+
+        // Several people can stream at once.
+        join(&mut s, &p2, 3, true, None).unwrap();
+        p2.next();
+        assert_eq!(v.next(), ServerMsg::PeerJoined { peer: info(3, true) });
+        p.next();
+        // Starting/stopping later is announced to everyone else, once.
+        assert!(s.set_streaming("ROOM", 2, true));
+        assert!(!s.set_streaming("ROOM", 2, true), "no change, no announcement");
+        assert_eq!(p.next(), ServerMsg::PeerUpdated { peer: info(2, true) });
+        assert_eq!(p2.next(), ServerMsg::PeerUpdated { peer: info(2, true) });
+        assert!(v.idle(), "not told about itself");
+        assert!(s.set_streaming("ROOM", 3, false));
+        assert_eq!(v.next(), ServerMsg::PeerUpdated { peer: info(3, false) });
+        p.next();
+        assert_eq!(s.disconnect("ROOM", 3, 3, false), Departure::Left);
+        p.next();
+        v.next();
 
         assert!(s.relay("ROOM", 1, ServerMsg::PeerLeft { id: 9 }));
         assert_eq!(p.next(), ServerMsg::PeerLeft { id: 9 });
         assert!(!s.relay("OTHER", 1, ServerMsg::PeerLeft { id: 9 }), "no cross-room relay");
 
-        assert_eq!(s.disconnect("ROOM", 2, 2), Departure::Left, "no token: leaves immediately");
+        assert_eq!(s.disconnect("ROOM", 2, 2, false), Departure::Left, "no token: leaves immediately");
         assert_eq!(p.next(), ServerMsg::PeerLeft { id: 2 });
-        assert_eq!(s.disconnect("ROOM", 1, 1), Departure::Left);
+        assert_eq!(s.disconnect("ROOM", 1, 1, false), Departure::Left);
         assert!(s.rooms.is_empty(), "empty rooms are removed");
     }
 
@@ -403,73 +443,86 @@ mod tests {
     fn resume_keeps_id_hides_the_blip_and_delivers_queued_messages() {
         let mut s = State::default();
         let (mut p, mut v) = (client(), client());
-        join(&mut s, &p, 1, Role::Publisher, Some("ptoken")).unwrap();
-        join(&mut s, &v, 2, Role::Viewer, Some("vtoken")).unwrap();
+        join(&mut s, &p, 1, true, Some("ptoken")).unwrap();
+        join(&mut s, &v, 2, false, Some("vtoken")).unwrap();
         p.next();
         p.next();
         v.next();
 
         // The viewer's connection drops; the publisher hears nothing.
-        assert_eq!(s.disconnect("ROOM", 2, 2), Departure::Away);
+        assert_eq!(s.disconnect("ROOM", 2, 2, false), Departure::Away);
         assert!(p.idle());
         // Meanwhile the publisher signals it; that's queued.
         assert!(s.relay("ROOM", 2, ServerMsg::PeerLeft { id: 42 }));
 
         // The viewer reconnects (new connection 7) with its token.
         let mut v2 = client();
-        let joined = s.join("ROOM", ("p2".into(), Role::Viewer, Some("vtoken".into())), 7, v2.tx.clone());
+        let joined = s.join("ROOM", ("p2".into(), false, Some("vtoken".into())), 7, v2.tx.clone());
         assert_eq!(joined, Ok(Joined { id: 2, resumed: true }));
-        assert_eq!(v2.next(), ServerMsg::Welcome { you: 2, peers: vec![info(1, Role::Publisher)], resumed: true });
+        assert_eq!(v2.next(), ServerMsg::Welcome { you: 2, peers: vec![info(1, true)], resumed: true });
         assert_eq!(v2.next(), ServerMsg::PeerLeft { id: 42 }, "queued message delivered after the welcome");
         assert!(p.idle(), "publisher never saw the viewer leave or rejoin");
 
         // The old connection's late cleanup doesn't remove the resumed peer,
         // and the grace timer for the old connection does nothing.
-        assert_eq!(s.disconnect("ROOM", 2, 2), Departure::Superseded);
+        assert_eq!(s.disconnect("ROOM", 2, 2, false), Departure::Superseded);
         assert!(!s.expire("ROOM", 2, 2));
         assert!(s.relay("ROOM", 2, ServerMsg::PeerLeft { id: 43 }));
         assert_eq!(v2.next(), ServerMsg::PeerLeft { id: 43 });
     }
 
     #[test]
-    fn unresumed_peers_expire_and_free_the_room() {
+    fn unresumed_peers_expire() {
         let mut s = State::default();
         let (p, mut v) = (client(), client());
-        join(&mut s, &p, 1, Role::Publisher, Some("ptoken")).unwrap();
-        join(&mut s, &v, 2, Role::Viewer, Some("vtoken")).unwrap();
+        join(&mut s, &p, 1, true, Some("ptoken")).unwrap();
+        join(&mut s, &v, 2, false, Some("vtoken")).unwrap();
         v.next();
 
-        assert_eq!(s.disconnect("ROOM", 1, 1), Departure::Away);
-        // While away, the publisher still holds the room.
-        assert!(join(&mut s, &client(), 3, Role::Publisher, Some("other")).is_err());
+        assert_eq!(s.disconnect("ROOM", 1, 1, false), Departure::Away);
+        // While away, nobody is told.
         assert!(v.idle());
 
         assert!(s.expire("ROOM", 1, 1));
         assert_eq!(v.next(), ServerMsg::PeerLeft { id: 1 });
-        assert!(join(&mut s, &client(), 4, Role::Publisher, None).is_ok(), "room is free again");
+        assert_eq!(s.rooms["ROOM"].len(), 1, "gone from the room");
+    }
+
+    #[test]
+    fn leaving_on_purpose_is_not_held() {
+        let mut s = State::default();
+        let (p, mut v) = (client(), client());
+        join(&mut s, &p, 1, true, Some("ptoken")).unwrap();
+        join(&mut s, &v, 2, false, Some("vtoken")).unwrap();
+        v.next();
+
+        // Despite having a resume token, the streamer said it's leaving.
+        assert_eq!(s.disconnect("ROOM", 1, 1, true), Departure::Left);
+        assert_eq!(v.next(), ServerMsg::PeerLeft { id: 1 }, "others hear right away");
+        assert_eq!(s.rooms["ROOM"].len(), 1);
     }
 
     #[test]
     fn resume_takes_over_a_connection_not_yet_known_dead() {
         let mut s = State::default();
         let (mut old, mut new) = (client(), client());
-        join(&mut s, &old, 1, Role::Viewer, Some("t")).unwrap();
+        join(&mut s, &old, 1, false, Some("t")).unwrap();
         old.next();
         // No disconnect seen yet, but the client reconnects anyway.
-        let joined = s.join("ROOM", ("p1".into(), Role::Viewer, Some("t".into())), 5, new.tx.clone());
+        let joined = s.join("ROOM", ("p1".into(), false, Some("t".into())), 5, new.tx.clone());
         assert_eq!(joined, Ok(Joined { id: 1, resumed: true }));
         new.next();
         assert!(s.relay("ROOM", 1, ServerMsg::PeerLeft { id: 9 }));
         assert_eq!(new.next(), ServerMsg::PeerLeft { id: 9 }, "messages go to the new connection");
         assert!(old.idle());
-        assert_eq!(s.disconnect("ROOM", 1, 1), Departure::Superseded);
+        assert_eq!(s.disconnect("ROOM", 1, 1, false), Departure::Superseded);
     }
 
     #[test]
     fn away_queue_is_bounded() {
         let mut s = State::default();
-        join(&mut s, &client(), 1, Role::Viewer, Some("t")).unwrap();
-        s.disconnect("ROOM", 1, 1);
+        join(&mut s, &client(), 1, false, Some("t")).unwrap();
+        s.disconnect("ROOM", 1, 1, false);
         for i in 0..1000 {
             s.relay("ROOM", 1, ServerMsg::PeerLeft { id: i });
         }

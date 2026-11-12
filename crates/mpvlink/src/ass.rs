@@ -69,6 +69,8 @@ pub struct TextStyle<'a> {
     pub spacing: f64,
     /// `None` keeps mpv's OSD font.
     pub font: Option<&'a str>,
+    /// Only draw the part of the text inside this rectangle.
+    pub clip: Option<Rect>,
 }
 
 impl Default for TextStyle<'_> {
@@ -80,6 +82,7 @@ impl Default for TextStyle<'_> {
             bold: false,
             spacing: 0.0,
             font: None,
+            clip: None,
         }
     }
 }
@@ -119,6 +122,17 @@ impl Ass {
         );
     }
 
+    /// A filled shape from ASS drawing commands (e.g. `m 0 0 l 10 5 l 0 10`).
+    pub fn shape(&mut self, path: &str, fill: Color) {
+        self.start_event();
+        let _ = write!(
+            self.out,
+            r"{{\an7\pos(0,0)\shad0\blur0\bord0\1c{}\1a{}\p1}}{path}{{\p0}}",
+            fill.bgr(),
+            fill.alpha(),
+        );
+    }
+
     /// Text anchored at (x, y). `body` may contain pre-built ASS spans (see
     /// [`span`]); plain user text must go through [`escape`] first.
     pub fn text(&mut self, x: f64, y: f64, style: &TextStyle, body: &str) {
@@ -135,6 +149,9 @@ impl Ass {
         );
         if let Some(font) = style.font {
             let _ = write!(self.out, r"\fn{font}");
+        }
+        if let Some(c) = style.clip {
+            let _ = write!(self.out, r"\clip({:.0},{:.0},{:.0},{:.0})", c.x, c.y, c.x + c.w, c.y + c.h);
         }
         self.out.push('}');
         self.out.push_str(body);

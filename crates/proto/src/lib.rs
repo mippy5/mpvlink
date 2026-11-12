@@ -3,15 +3,19 @@
 //! JSON messages over a WebSocket. The server only matches peers by room code
 //! and relays [`Signal`]s between them; media never touches it.
 //!
-//! Flow for one publisher (P) and one viewer (V) in a room:
+//! Anyone in a room can stream, and each person chooses whose stream to
+//! watch. Flow for a viewer (V) watching a streamer (S):
 //!
 //! ```text
-//! P -> server: join {role: publisher}      V -> server: join {role: viewer}
-//! server -> P: welcome {peers: [...]}      server -> V: welcome {peers: [...]}
-//! server -> P: peer_joined {V}             (or V is already in P's welcome)
-//! P -> V: offer      (relayed: signal {to} -> signal {from})
-//! V -> P: answer
-//! V -> P: keyframe_request                 (whenever V needs a fresh keyframe)
+//! S -> server: join {streaming: true}      V -> server: join {streaming: false}
+//!              (or later: set_streaming {streaming: true} -> others get peer_updated)
+//! server -> V: welcome {peers: [S, ...]}   (V sees S is streaming)
+//! V -> S: watch      (relayed: signal {to} -> signal {from})
+//! S -> V: offer
+//! V -> S: answer
+//! V -> S: keyframe_request                 (whenever V needs a fresh keyframe)
+//! S -> V: subtitle {text}                  (the line S is seeing; "" clears)
+//! V -> S: unwatch                          (V switched to someone else)
 //! ```
 //!
 //! ICE candidates aren't trickled: each side waits for gathering to finish and
@@ -21,7 +25,8 @@
 //! WebSocket drops, the server keeps their place for [`RESUME_GRACE_SECS`]
 //! without telling anyone, queueing messages for them. Rejoining with the same
 //! token within that window gets the same peer id back (`welcome.resumed`),
-//! so other peers never notice and peer-to-peer media keeps flowing.
+//! so other peers never notice and peer-to-peer media keeps flowing. A client
+//! that's quitting sends `leave` first, so it isn't held.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,20 +41,13 @@ pub const MAX_RESUME_TOKEN_LEN: usize = 64;
 /// How long the server holds a disconnected peer's place for them to resume.
 pub const RESUME_GRACE_SECS: u64 = 30;
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    /// Sends the stream. At most one per room.
-    Publisher,
-    /// Watches the stream.
-    Viewer,
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {
     pub id: PeerId,
     pub name: String,
-    pub role: Role,
+    /// Has a stream others can watch.
+    #[serde(default)]
+    pub streaming: bool,
 }
 
 /// Messages from a client to the server.
@@ -60,13 +58,21 @@ pub enum ClientMsg {
     Join {
         room: String,
         name: String,
-        role: Role,
+        /// Already streaming (e.g. rejoining after a reconnect).
+        #[serde(default)]
+        streaming: bool,
         /// Client-chosen secret identifying this session across reconnects.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resume: Option<String>,
     },
     /// Relay a signal to another peer in the same room.
     Signal { to: PeerId, signal: Signal },
+    /// Started or stopped streaming; everyone else gets `peer_updated`.
+    SetStreaming { streaming: bool },
+    /// Leaving on purpose (sent just before closing the connection): the
+    /// server removes you right away instead of holding your place for a
+    /// resume, so others see you leave immediately.
+    Leave,
 }
 
 /// Messages from the server to a client.
@@ -83,6 +89,8 @@ pub enum ServerMsg {
         resumed: bool,
     },
     PeerJoined { peer: PeerInfo },
+    /// Someone started or stopped streaming.
+    PeerUpdated { peer: PeerInfo },
     PeerLeft { id: PeerId },
     Signal { from: PeerId, signal: Signal },
     /// The request was rejected. If it was the `Join`, the server closes the connection.
@@ -93,10 +101,16 @@ pub enum ServerMsg {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Signal {
+    /// Viewer -> streamer: send me your stream (answered with an offer).
+    Watch,
+    /// Viewer -> streamer: stop sending me your stream.
+    Unwatch,
     Offer { sdp: String },
     Answer { sdp: String },
-    /// Viewer -> publisher: please send a keyframe (on join, or after loss).
+    /// Viewer -> streamer: please send a keyframe (on join, or after loss).
     KeyframeRequest,
+    /// Streamer -> viewer: the subtitle line shown now ("" when there's none).
+    Subtitle { text: String },
 }
 
 /// Normalize a room code: uppercase letters and digits only. Returns None if
@@ -161,11 +175,13 @@ mod tests {
             serde_json::to_string(&msg).unwrap(),
             r#"{"type":"signal","to":7,"signal":{"kind":"offer","sdp":"v=0"}}"#
         );
-        let msg = ClientMsg::Join { room: "ABCD".into(), name: "Ana".into(), role: Role::Viewer, resume: None };
+        let msg = ClientMsg::Join { room: "ABCD".into(), name: "Ana".into(), streaming: false, resume: None };
         assert_eq!(
             serde_json::to_string(&msg).unwrap(),
-            r#"{"type":"join","room":"ABCD","name":"Ana","role":"viewer"}"#
+            r#"{"type":"join","room":"ABCD","name":"Ana","streaming":false}"#
         );
+        let msg = ClientMsg::Signal { to: 2, signal: Signal::Watch };
+        assert_eq!(serde_json::to_string(&msg).unwrap(), r#"{"type":"signal","to":2,"signal":{"kind":"watch"}}"#);
         // Old clients/servers without the resume fields still interoperate.
         let old: ServerMsg = serde_json::from_str(r#"{"type":"welcome","you":1,"peers":[]}"#).unwrap();
         assert_eq!(old, ServerMsg::Welcome { you: 1, peers: vec![], resumed: false });

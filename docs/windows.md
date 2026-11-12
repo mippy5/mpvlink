@@ -48,7 +48,14 @@ Settings, and `Ctrl+V` pastes. Your display name and server setting are saved in
 
 The first time you join a room, Windows Defender Firewall may ask whether mpv
 may communicate on the network. Allow it (at least on private networks), or
-video may not arrive when the publisher is on another network.
+video may not arrive when the person streaming is on another network.
+
+To stream your own videos you also need ffmpeg (see
+[streaming.md](streaming.md)): put `ffmpeg.exe` on your PATH, or set
+`script-opts-append=mpvlink-ffmpeg=C:\path\to\ffmpeg.exe` in `mpv.conf`.
+NVIDIA (NVENC) and Intel (Quick Sync) hardware encoders are used when present;
+those two haven't been tested yet, and ffmpeg falls back to x264 if they fail
+to start.
 
 ## Running the server or test publisher on Windows
 

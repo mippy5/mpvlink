@@ -16,23 +16,23 @@ use std::time::Instant;
 const CARET_BLINK_MS: u128 = 530;
 
 // Palette.
-const BACKDROP: Color = Color::rgb(0x000000).with_opacity(150);
-const SHADOW: Color = Color::rgb(0x000000).with_opacity(140);
-const PANEL: Color = Color::rgb(0x2B2D31);
-const PANEL_EDGE: Color = Color::rgb(0x3F4147);
-const FIELD: Color = Color::rgb(0x1E1F22);
-const FIELD_EDGE: Color = Color::rgb(0x3F4147);
-const ACCENT: Color = Color::rgb(0x5865F2);
-const ACCENT_HOVER: Color = Color::rgb(0x4752C4);
-const ACCENT_DISABLED: Color = Color::rgb(0x5865F2).with_opacity(110);
-const GHOST_HOVER: Color = Color::rgb(0x3A3C42);
-const SECONDARY: Color = Color::rgb(0x4E5058);
-const SECONDARY_HOVER: Color = Color::rgb(0x6D6F78);
-const TEXT: Color = Color::rgb(0xF2F3F5);
-const TEXT_MUTED: Color = Color::rgb(0xB5BAC1);
-const TEXT_FAINT: Color = Color::rgb(0x80848E);
-const ERROR: Color = Color::rgb(0xFA777C);
-const WARNING: Color = Color::rgb(0xF0B232);
+pub(crate) const BACKDROP: Color = Color::rgb(0x000000).with_opacity(150);
+pub(crate) const SHADOW: Color = Color::rgb(0x000000).with_opacity(140);
+pub(crate) const PANEL: Color = Color::rgb(0x2B2D31);
+pub(crate) const PANEL_EDGE: Color = Color::rgb(0x3F4147);
+pub(crate) const FIELD: Color = Color::rgb(0x1E1F22);
+pub(crate) const FIELD_EDGE: Color = Color::rgb(0x3F4147);
+pub(crate) const ACCENT: Color = Color::rgb(0x5865F2);
+pub(crate) const ACCENT_HOVER: Color = Color::rgb(0x4752C4);
+pub(crate) const ACCENT_DISABLED: Color = Color::rgb(0x5865F2).with_opacity(110);
+pub(crate) const GHOST_HOVER: Color = Color::rgb(0x3A3C42);
+pub(crate) const SECONDARY: Color = Color::rgb(0x4E5058);
+pub(crate) const SECONDARY_HOVER: Color = Color::rgb(0x6D6F78);
+pub(crate) const TEXT: Color = Color::rgb(0xF2F3F5);
+pub(crate) const TEXT_MUTED: Color = Color::rgb(0xB5BAC1);
+pub(crate) const TEXT_FAINT: Color = Color::rgb(0x80848E);
+pub(crate) const ERROR: Color = Color::rgb(0xFA777C);
+pub(crate) const WARNING: Color = Color::rgb(0xF0B232);
 
 #[cfg(target_os = "macos")]
 const MONO_FONT: &str = "Menlo";

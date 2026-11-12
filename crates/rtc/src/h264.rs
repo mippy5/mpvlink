@@ -121,10 +121,11 @@ impl FrameAssembler {
 }
 
 /// Convert an Annex B frame to a list of NAL units with 4-byte start codes,
-/// which is the form `TrackLocalStaticSample` packetizes from.
-pub fn normalize_start_codes(annex_b: &[u8]) -> Bytes {
+/// which is the form `TrackLocalStaticSample` packetizes from, leaving out
+/// NAL units of the types in `skip`.
+pub fn normalize_start_codes(annex_b: &[u8], skip: &[u8]) -> Bytes {
     let mut out = BytesMut::with_capacity(annex_b.len() + 16);
-    for nal in nal_units(annex_b) {
+    for nal in nal_units(annex_b).filter(|nal| !skip.contains(&(nal[0] & 0x1F))) {
         out.put_slice(START_CODE);
         out.put_slice(nal);
     }
@@ -207,7 +208,14 @@ mod tests {
 
     #[test]
     fn normalizes_three_byte_start_codes() {
-        let out = normalize_start_codes(&[0, 0, 1, 0x67, 1, 0, 0, 1, 0x65, 2]);
+        let out = normalize_start_codes(&[0, 0, 1, 0x67, 1, 0, 0, 1, 0x65, 2], &[]);
+        assert_eq!(&out[..], &[0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x65, 2]);
+    }
+
+    #[test]
+    fn leaves_out_skipped_nal_types() {
+        // AUD, SPS, IDR -> SPS, IDR
+        let out = normalize_start_codes(&[0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x65, 2], &[9]);
         assert_eq!(&out[..], &[0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x65, 2]);
     }
 }

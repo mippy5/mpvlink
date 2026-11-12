@@ -52,6 +52,7 @@ pub const MPV_EVENT_NONE: c_int = 0;
 pub const MPV_EVENT_SHUTDOWN: c_int = 1;
 pub const MPV_EVENT_FILE_LOADED: c_int = 8;
 pub const MPV_EVENT_CLIENT_MESSAGE: c_int = 16;
+pub const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
 pub const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
 
 pub const MPV_ERROR_LOADING_FAILED: c_int = -13;
@@ -152,7 +153,6 @@ mpv_functions! {
         name: *const c_char,
         format: c_int,
     ) -> c_int;
-    pub fn mpv_unobserve_property(ctx: *mut mpv_handle, registered_reply_userdata: u64) -> c_int;
     pub fn mpv_error_string(error: c_int) -> *const c_char;
     pub fn mpv_free(data: *mut c_void);
 }

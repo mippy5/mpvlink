@@ -1,4 +1,6 @@
-//! The `mpvlink://ROOM` stream protocol: how received video gets into mpv.
+//! The `mpvlink://ROOM/PEER` stream protocol: how received video gets into
+//! mpv. Each room has one queue, carrying whichever stream is being watched;
+//! the peer part of the URL just makes switching streams a new file for mpv.
 //!
 //! The WebRTC session pushes whole H.264 frames into a [`FrameQueue`]; mpv's
 //! demuxer pulls bytes out through the stream callbacks below, as if reading
@@ -121,7 +123,7 @@ fn routes() -> &'static Mutex<HashMap<String, Arc<FrameQueue>>> {
     ROUTES.get_or_init(Default::default)
 }
 
-/// Make `mpvlink://ROOM` read from `queue`.
+/// Make `mpvlink://ROOM/...` read from `queue`.
 pub fn publish(room: &str, queue: Arc<FrameQueue>) {
     routes().lock().unwrap().insert(room.to_string(), queue);
 }
@@ -130,8 +132,8 @@ pub fn unpublish(room: &str) {
     routes().lock().unwrap().remove(room);
 }
 
-pub fn url(room: &str) -> String {
-    format!("{PROTOCOL}://{room}")
+pub fn url(room: &str, peer: u64) -> String {
+    format!("{PROTOCOL}://{room}/{peer}")
 }
 
 // ---- mpv stream callbacks ---------------------------------------------------
@@ -148,7 +150,8 @@ struct Reader {
 /// `mpv_stream_cb_open_ro_fn` for [`PROTOCOL`].
 pub unsafe extern "C" fn open(_user_data: *mut c_void, uri: *mut c_char, info: *mut mpv_stream_cb_info) -> c_int {
     let uri = unsafe { CStr::from_ptr(uri) }.to_string_lossy();
-    let room = uri.trim_start_matches(PROTOCOL).trim_start_matches("://").trim_end_matches('/');
+    let rest = uri.trim_start_matches(PROTOCOL).trim_start_matches("://");
+    let room = rest.split('/').next().unwrap_or_default();
     let Some(queue) = routes().lock().unwrap().get(room).cloned() else {
         return MPV_ERROR_LOADING_FAILED;
     };

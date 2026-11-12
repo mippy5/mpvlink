@@ -14,6 +14,8 @@ pub enum Event {
     None,
     Shutdown,
     FileLoaded,
+    /// Playback (re)started after a seek or loading a file.
+    PlaybackRestart,
     /// A `script-message-to` / `script-binding` addressed to this client.
     ClientMessage(Vec<String>),
     /// An observed property changed; `id` is the id passed to `observe`.
@@ -78,16 +80,7 @@ impl Mpv {
     }
 
     pub fn get_string(&self, name: &str) -> Option<String> {
-        let name = CString::new(name).ok()?;
-        unsafe {
-            let raw = mpv_get_property_string(self.ctx, name.as_ptr());
-            if raw.is_null() {
-                return None;
-            }
-            let value = cstr_to_string(raw);
-            mpv_free(raw.cast());
-            Some(value)
-        }
+        self.remote().get_string(name)
     }
 
     pub fn get_f64(&self, name: &str) -> Option<f64> {
@@ -114,10 +107,6 @@ impl Mpv {
         check(unsafe { mpv_observe_property(self.ctx, id, name.as_ptr(), MPV_FORMAT_NONE) })
     }
 
-    pub fn unobserve(&self, id: u64) {
-        unsafe { mpv_unobserve_property(self.ctx, id) };
-    }
-
     /// Wait for the next event; a negative timeout waits forever.
     pub fn wait_event(&self, timeout: f64) -> Event {
         let ev = unsafe { &*mpv_wait_event(self.ctx, timeout) };
@@ -125,6 +114,7 @@ impl Mpv {
             MPV_EVENT_NONE => Event::None,
             MPV_EVENT_SHUTDOWN => Event::Shutdown,
             MPV_EVENT_FILE_LOADED => Event::FileLoaded,
+            MPV_EVENT_PLAYBACK_RESTART => Event::PlaybackRestart,
             MPV_EVENT_CLIENT_MESSAGE => {
                 let msg = unsafe { &*(ev.data as *const mpv_event_client_message) };
                 let args = (0..msg.num_args as usize)
@@ -166,6 +156,23 @@ impl Remote {
     pub fn command(&self, args: &[&str]) -> Result<()> {
         let args = CArgs::new(args)?;
         check(unsafe { mpv_command(self.ctx, args.ptrs()) })
+    }
+
+    pub fn get_string(&self, name: &str) -> Option<String> {
+        let name = CString::new(name).ok()?;
+        unsafe {
+            let raw = mpv_get_property_string(self.ctx, name.as_ptr());
+            if raw.is_null() {
+                return None;
+            }
+            let value = cstr_to_string(raw);
+            mpv_free(raw.cast());
+            Some(value)
+        }
+    }
+
+    pub fn get_f64(&self, name: &str) -> Option<f64> {
+        self.get_string(name)?.parse().ok()
     }
 }
 

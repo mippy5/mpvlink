@@ -10,10 +10,11 @@
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use mpvlink_proto::{ClientMsg, PeerId, Role, ServerMsg, Signal};
+use mpvlink_proto::{ClientMsg, PeerId, ServerMsg, Signal};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -22,6 +23,10 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Ping this often so idle connections (a viewer waiting in a room) aren't
 /// dropped by NATs or proxies, and so a dead connection is noticed.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long [`Signaling::close`] waits to say goodbye before giving up (e.g.
+/// while the server is unreachable).
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Reconnect delays; the last one repeats. The early ones fit well inside the
 /// server's resume grace period (30 s).
@@ -46,7 +51,8 @@ fn install_crypto_provider() {
 pub struct JoinInfo {
     pub room: String,
     pub name: String,
-    pub role: Role,
+    /// Streaming already when joining.
+    pub streaming: bool,
 }
 
 /// What the connection reports.
@@ -67,7 +73,16 @@ pub enum SignalingEvent {
 /// `ServerMsg::Error` comes first), or once every `Signaling` is dropped.
 #[derive(Clone)]
 pub struct Signaling {
-    tx: mpsc::UnboundedSender<ClientMsg>,
+    tx: mpsc::UnboundedSender<Outgoing>,
+    /// Shared with the connection task, which rejoins with it after a reconnect.
+    join: Arc<Mutex<JoinInfo>>,
+}
+
+/// What the connection task is asked to do, in order.
+enum Outgoing {
+    Msg(ClientMsg),
+    /// Send `Leave`, close the WebSocket, then report back.
+    Leave(oneshot::Sender<()>),
 }
 
 impl Signaling {
@@ -83,19 +98,45 @@ impl Signaling {
 
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let conn = Connection { url: url.to_string(), join, token: resume_token(), out_rx, events: events_tx, unsent: None };
+        let join = Arc::new(Mutex::new(join));
+        let conn = Connection {
+            url: url.to_string(),
+            join: join.clone(),
+            token: resume_token(),
+            out_rx,
+            events: events_tx,
+            unsent: None,
+        };
         tokio::spawn(conn.run(ws));
-        Ok((Self { tx: out_tx }, events_rx))
+        Ok((Self { tx: out_tx, join }, events_rx))
     }
 
     /// Queue a message. While reconnecting, messages wait and are sent once
     /// the connection is back.
     pub fn send(&self, msg: ClientMsg) {
-        let _ = self.tx.send(msg);
+        let _ = self.tx.send(Outgoing::Msg(msg));
+    }
+
+    /// Leave the room and close the connection cleanly, after any messages
+    /// already queued. The server then tells the others right away, instead
+    /// of holding our place for a reconnect. Gives up after a second if the
+    /// server can't be reached; the connection is finished either way.
+    pub async fn close(&self) {
+        let (done_tx, done_rx) = oneshot::channel();
+        if self.tx.send(Outgoing::Leave(done_tx)).is_ok() {
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, done_rx).await;
+        }
     }
 
     pub fn signal(&self, to: PeerId, signal: Signal) {
         self.send(ClientMsg::Signal { to, signal });
+    }
+
+    /// Tell the room we started or stopped streaming. Remembered, so that
+    /// rejoining after a server restart says so too.
+    pub fn set_streaming(&self, streaming: bool) {
+        self.join.lock().unwrap().streaming = streaming;
+        self.send(ClientMsg::SetStreaming { streaming });
     }
 }
 
@@ -126,9 +167,9 @@ enum Ended {
 
 struct Connection {
     url: String,
-    join: JoinInfo,
+    join: Arc<Mutex<JoinInfo>>,
     token: String,
-    out_rx: mpsc::UnboundedReceiver<ClientMsg>,
+    out_rx: mpsc::UnboundedReceiver<Outgoing>,
     events: mpsc::UnboundedSender<SignalingEvent>,
     /// A message taken from the queue whose send failed; resent first.
     unsent: Option<ClientMsg>,
@@ -168,11 +209,14 @@ impl Connection {
         let (mut ws_tx, mut ws_rx) = ws.split();
         let lost = |e: &dyn std::fmt::Display, welcomed| Ended::Lost { error: e.to_string(), welcomed };
 
-        let join = ClientMsg::Join {
-            room: self.join.room.clone(),
-            name: self.join.name.clone(),
-            role: self.join.role,
-            resume: Some(self.token.clone()),
+        let join = {
+            let info = self.join.lock().unwrap();
+            ClientMsg::Join {
+                room: info.room.clone(),
+                name: info.name.clone(),
+                streaming: info.streaming,
+                resume: Some(self.token.clone()),
+            }
         };
         if let Err(e) = ws_tx.send(text(&join)).await {
             return lost(&e, false);
@@ -184,10 +228,23 @@ impl Connection {
         loop {
             tokio::select! {
                 // Queued messages go out only once joined (the server requires Join first).
-                msg = next_outgoing(&mut self.unsent, &mut self.out_rx), if welcomed => {
-                    let Some(msg) = msg else {
-                        let _ = ws_tx.close().await;
-                        return Ended::ForGood; // every Signaling handle was dropped
+                out = next_outgoing(&mut self.unsent, &mut self.out_rx), if welcomed => {
+                    let msg = match out {
+                        Some(Outgoing::Msg(msg)) => msg,
+                        Some(Outgoing::Leave(done)) => {
+                            let _ = ws_tx.send(text(&ClientMsg::Leave)).await;
+                            // Close frame, then wait (briefly) for the server's
+                            // side of the closing handshake.
+                            let _ = ws_tx.close().await;
+                            let drain = async { while ws_rx.next().await.is_some() {} };
+                            let _ = tokio::time::timeout(CLOSE_TIMEOUT, drain).await;
+                            let _ = done.send(());
+                            return Ended::ForGood;
+                        }
+                        None => {
+                            let _ = ws_tx.close().await;
+                            return Ended::ForGood; // every Signaling handle was dropped
+                        }
                     };
                     if let Err(e) = ws_tx.send(text(&msg)).await {
                         self.unsent = Some(msg);
@@ -226,9 +283,9 @@ impl Connection {
 }
 
 /// The message that failed to send last time, else the next queued one.
-async fn next_outgoing(unsent: &mut Option<ClientMsg>, queue: &mut mpsc::UnboundedReceiver<ClientMsg>) -> Option<ClientMsg> {
+async fn next_outgoing(unsent: &mut Option<ClientMsg>, queue: &mut mpsc::UnboundedReceiver<Outgoing>) -> Option<Outgoing> {
     match unsent.take() {
-        Some(msg) => Some(msg),
+        Some(msg) => Some(Outgoing::Msg(msg)),
         None => queue.recv().await,
     }
 }

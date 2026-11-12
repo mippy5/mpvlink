@@ -154,9 +154,13 @@ sudo systemctl restart mpvlink-signal
 A restart briefly disconnects everyone from the server. Clients reconnect on
 their own (retrying after 0.5, 1, 2, 4 and 8 seconds, then every 15 seconds),
 and streams in progress keep playing meanwhile, since video is peer to peer.
-Because a restarted server has forgotten who was where, publishers then set
-up their connections to viewers again, which shows up as a hiccup of a second
-or two in the video.
+Because a restarted server has forgotten who was where, viewers then ask
+again for the streams they were watching, which shows up as a hiccup of a
+second or two in the video.
+
+The server and every client must be from the same version of mpvlink: older
+clients can't talk to a newer server (the protocol changed when rooms gained
+multiple streamers), so update them together.
 
 Shorter interruptions (a Caddy reload, a network blip on either side) are
 invisible: the server holds each client's place for 30 seconds, and a client
@@ -169,8 +173,8 @@ that reconnects within that time picks up exactly where it was.
 | `curl` gets `502 Bad Gateway` | The service isn't running: `systemctl status mpvlink-signal`. |
 | `curl`/client TLS errors right after setup | Certificate not issued yet: DNS doesn't point at the server, or port 80/443 is blocked. Check `journalctl -u caddy`. |
 | mpv keeps saying "Lost connection to the server. Reconnecting…" | The server is down or unreachable (`systemctl status mpvlink-signal`, `journalctl -u caddy`). The current stream keeps playing; clients reconnect on their own once it's back. |
-| Signaling works (you see "X started streaming. Connecting…") but no video | The peers can't reach each other directly, typically a strict NAT/firewall. This needs a TURN relay, which mpvlink doesn't support yet. |
-| `This room already has someone streaming.` | Rooms allow one publisher. If the previous one crashed, the server holds its place for 30 s in case it reconnects. If it vanished without closing its connection (power or network loss), the server first takes up to 90 s to notice. Try again after that. |
+| Signaling works (you see "Connecting to X's stream…") but no video | The peers can't reach each other directly, typically a strict NAT/firewall. This needs a TURN relay, which mpvlink doesn't support yet. |
+| Someone who quit still shows in the list | Their connection broke instead of closing (crash, network loss), so the server holds their place for 30 s in case they come back, and may first take up to 90 s to notice a connection that went silent. |
 
 ## Using an IP address instead of a domain
 

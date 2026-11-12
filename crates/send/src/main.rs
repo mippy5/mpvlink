@@ -1,7 +1,7 @@
 //! mpvlink-send: a test publisher.
 //!
-//! Joins a room as the publisher and streams a generated H.264 test pattern
-//! to every viewer (one peer connection each). The top-left of each frame
+//! Joins a room, streaming a generated H.264 test pattern to everyone who
+//! chooses to watch it (one peer connection each). The top-left of each frame
 //! encodes the send time as 32 black/white blocks (milliseconds since the Unix
 //! epoch, low 32 bits, most significant first) so glass-to-glass latency can
 //! be measured from a screenshot of the viewer.
@@ -12,18 +12,10 @@
 mod pattern;
 
 use anyhow::{Context, Result, bail};
-use bytes::Bytes;
-use mpvlink_rtc::h264::normalize_start_codes;
-use mpvlink_rtc::peer::{self, ConnectionState, PeerEvent, h264_codec, new_peer_connection, random_ssrc};
-use mpvlink_rtc::proto::{PeerId, Role, ServerMsg, Signal, normalize_name, normalize_room};
-use mpvlink_rtc::rtc::media::Sample;
-use mpvlink_rtc::rtc::media_stream::MediaStreamTrack;
-use mpvlink_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
-use mpvlink_rtc::rtc::rtp_transceiver::rtp_sender::{RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
+use mpvlink_rtc::peer;
+use mpvlink_rtc::proto::{PeerId, ServerMsg, normalize_name, normalize_room};
+use mpvlink_rtc::publish::{Frame, Publisher};
 use mpvlink_rtc::signaling::{JoinInfo, Signaling, SignalingEvent};
-use mpvlink_rtc::webrtc::media_stream::track_local::TrackLocal;
-use mpvlink_rtc::webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
-use mpvlink_rtc::webrtc::peer_connection::PeerConnection;
 use openh264::OpenH264API;
 use openh264::encoder::{
     BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Profile, RateControlMode,
@@ -33,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 struct Args {
     server: String,
@@ -46,58 +38,29 @@ struct Args {
     ice_servers: Vec<String>,
 }
 
-/// One encoded frame, shared by all viewers.
-#[derive(Clone)]
-struct Frame {
-    data: Bytes,
-    keyframe: bool,
-    duration: Duration,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Arc::new(parse_args()?);
-    let join = JoinInfo { room: args.room.clone(), name: args.name.clone(), role: Role::Publisher };
+    let join = JoinInfo { room: args.room.clone(), name: args.name.clone(), streaming: true };
     let (signaling, mut incoming) = Signaling::connect(&args.server, join).await?;
+    let log = Arc::new(|line: String| println!("{line}"));
+    let mut publisher = Publisher::new(signaling.clone(), args.ice_servers.clone(), log);
 
     // Encoder runs on its own thread; frames fan out to viewers.
-    let (frames_tx, _) = broadcast::channel::<Frame>(8);
-    let keyframe_wanted = Arc::new(AtomicBool::new(true));
     {
-        let (args, frames_tx, keyframe_wanted) = (args.clone(), frames_tx.clone(), keyframe_wanted.clone());
+        let (args, frames, keyframe_wanted) = (args.clone(), publisher.frames(), publisher.keyframe_wanted());
         std::thread::Builder::new()
             .name("encoder".into())
             .spawn(move || {
-                if let Err(e) = run_encoder(&args, &frames_tx, &keyframe_wanted) {
+                if let Err(e) = run_encoder(&args, &frames, &keyframe_wanted) {
                     eprintln!("encoder stopped: {e:#}");
                     std::process::exit(1);
                 }
             })?;
     }
 
-    // Per-viewer tasks, plus a channel to forward each one its answer.
-    let mut viewers: HashMap<PeerId, (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<String>)> =
-        HashMap::new();
-    let spawn_viewer = |id: PeerId, name: String| {
-        let (answer_tx, answer_rx) = mpsc::unbounded_channel();
-        let ctx = ViewerCtx {
-            id,
-            name,
-            signaling: signaling.clone(),
-            frames: frames_tx.clone(),
-            keyframe_wanted: keyframe_wanted.clone(),
-            ice_servers: args.ice_servers.clone(),
-        };
-        let task = tokio::spawn(async move {
-            let (id, name) = (ctx.id, ctx.name.clone());
-            match serve_viewer(ctx, answer_rx).await {
-                Ok(()) => println!("{name} ({id}) disconnected"),
-                Err(e) => println!("{name} ({id}): {e:#}"),
-            }
-        });
-        (task, answer_tx)
-    };
-
+    // Names of everyone else in the room, for messages.
+    let mut names: HashMap<PeerId, String> = HashMap::new();
     let mut welcomed = false;
     loop {
         let event = tokio::select! {
@@ -123,142 +86,38 @@ async fn main() -> Result<()> {
                     println!("Reconnected to the signaling server.");
                 } else {
                     // The server lost its state (restarted): everyone has new
-                    // ids, so start over with whoever is in the room now.
-                    println!("Reconnected to the signaling server (fresh session, peer {you}); reconnecting viewers.");
-                    for (_, (task, _)) in viewers.drain() {
-                        task.abort();
-                    }
+                    // ids. Viewers ask to watch again on their own.
+                    println!("Reconnected to the signaling server (fresh session, peer {you}).");
+                    publisher.clear();
                 }
                 welcomed = true;
-                // After a resume, anyone who joined meanwhile was announced via
-                // queued messages; this only catches what we don't know yet.
-                for p in peers.into_iter().filter(|p| p.role == Role::Viewer) {
-                    viewers.entry(p.id).or_insert_with(|| spawn_viewer(p.id, p.name));
-                }
+                names = peers.into_iter().map(|p| (p.id, p.name)).collect();
             }
-            ServerMsg::PeerJoined { peer } if peer.role == Role::Viewer => {
+            ServerMsg::PeerJoined { peer } => {
                 println!("{} ({}) joined", peer.name, peer.id);
-                viewers.insert(peer.id, spawn_viewer(peer.id, peer.name));
+                names.insert(peer.id, peer.name);
             }
-            ServerMsg::PeerJoined { .. } => {}
+            ServerMsg::PeerUpdated { peer } => {
+                names.insert(peer.id, peer.name);
+            }
             ServerMsg::PeerLeft { id } => {
-                if let Some((task, _)) = viewers.remove(&id) {
-                    task.abort();
+                publisher.unwatch(id);
+                if let Some(name) = names.remove(&id) {
+                    println!("{name} ({id}) left");
                 }
             }
-            ServerMsg::Signal { from, signal: Signal::Answer { sdp } } => {
-                if let Some((_, answer_tx)) = viewers.get(&from) {
-                    let _ = answer_tx.send(sdp);
-                }
+            ServerMsg::Signal { from, signal } => {
+                let name = names.get(&from).map_or("?", String::as_str).to_string();
+                publisher.handle(from, &name, &signal);
             }
-            ServerMsg::Signal { signal: Signal::KeyframeRequest, .. } => {
-                keyframe_wanted.store(true, Ordering::Relaxed);
-            }
-            ServerMsg::Signal { .. } => {}
             ServerMsg::Error { message } => bail!("server: {message}"),
         }
     }
-    Ok(())
-}
-
-struct ViewerCtx {
-    id: PeerId,
-    name: String,
-    signaling: Signaling,
-    frames: broadcast::Sender<Frame>,
-    keyframe_wanted: Arc<AtomicBool>,
-    ice_servers: Vec<String>,
-}
-
-/// Offer our video to one viewer, then forward encoded frames to them until
-/// they leave or the connection fails.
-async fn serve_viewer(ctx: ViewerCtx, mut answers: mpsc::UnboundedReceiver<String>) -> Result<()> {
-    let (pc, mut events) = new_peer_connection(&ctx.ice_servers).await?;
-
-    let ssrc = random_ssrc();
-    let track = Arc::new(TrackLocalStaticSample::new(
-        Instant::now(),
-        MediaStreamTrack::new(
-            "mpvlink".to_string(),
-            "mpvlink-video".to_string(),
-            "mpvlink video".to_string(),
-            RtpCodecKind::Video,
-            vec![RTCRtpEncodingParameters {
-                rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
-                codec: h264_codec(),
-                ..Default::default()
-            }],
-        ),
-    )?);
-    let sender = pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>).await?;
-
-    let offer = pc.create_offer(None).await?;
-    pc.set_local_description(offer).await?;
-    let mut deferred = peer::wait_for_gathering(&mut events).await;
-    let local = pc.local_description().await.context("no local description")?;
-    ctx.signaling.signal(ctx.id, Signal::Offer { sdp: local.sdp });
-
-    let answer = answers.recv().await.context("viewer left before answering")?;
-    pc.set_remote_description(RTCSessionDescription::answer(answer)?).await?;
-
-    // Wait until connected.
-    loop {
-        let event = match deferred.pop() {
-            Some(e) => e,
-            None => events.recv().await.context("peer connection closed")?,
-        };
-        match event {
-            PeerEvent::State(ConnectionState::Connected) => break,
-            PeerEvent::State(s @ (ConnectionState::Failed | ConnectionState::Closed)) => bail!("connection {s}"),
-            _ => {}
-        }
-    }
-    println!("{} ({}) connected", ctx.name, ctx.id);
-
-    let payload_type = sender
-        .get_parameters()
-        .await?
-        .rtp_parameters
-        .codecs
-        .first()
-        .map(|c| c.payload_type)
-        .context("no negotiated codec")?;
-
-    // Start them on a keyframe; skip frames until one comes.
-    let mut frames = ctx.frames.subscribe();
-    ctx.keyframe_wanted.store(true, Ordering::Relaxed);
-    let mut waiting_for_keyframe = true;
-    loop {
-        tokio::select! {
-            frame = frames.recv() => match frame {
-                Ok(frame) => {
-                    if waiting_for_keyframe && !frame.keyframe {
-                        continue;
-                    }
-                    waiting_for_keyframe = false;
-                    track
-                        .sample_writer(ssrc, payload_type)
-                        .write_sample(&Sample { data: frame.data, duration: frame.duration, ..Sample::new(Instant::now()) })
-                        .await?;
-                }
-                // We fell behind and frames were dropped: resync on a keyframe.
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    waiting_for_keyframe = true;
-                    ctx.keyframe_wanted.store(true, Ordering::Relaxed);
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            },
-            event = events.recv() => match event {
-                Some(PeerEvent::State(s @ (ConnectionState::Failed | ConnectionState::Closed))) => {
-                    println!("{} ({}) connection {s}", ctx.name, ctx.id);
-                    break;
-                }
-                Some(_) => {}
-                None => break,
-            },
-        }
-    }
-    let _ = pc.close().await;
+    // Ctrl+C: tell the server we're leaving, so viewers see the stream end
+    // right away rather than after the server's 30 s reconnect window.
+    println!("Leaving room {}…", args.room);
+    drop(publisher);
+    signaling.close().await;
     Ok(())
 }
 
@@ -290,7 +149,7 @@ fn run_encoder(args: &Args, frames: &broadcast::Sender<Frame>, keyframe_wanted: 
         let data = bitstream.to_vec();
         if !data.is_empty() {
             // No receivers is fine (nobody watching yet).
-            let _ = frames.send(Frame { data: normalize_start_codes(&data), keyframe, duration: interval });
+            let _ = frames.send(Frame::new(&data, keyframe, interval));
         }
 
         next += interval;

@@ -12,29 +12,50 @@
 //! Options (`--script-opts=key=value,...`); these override saved settings:
 //!   mpvlink-server=wss://host       signaling server (default: saved setting, else ws://127.0.0.1:8787)
 //!   mpvlink-stun=stun:host:port     STUN server, or "no" for none (default: Google's public one)
+//!   mpvlink-ffmpeg=/path/to/ffmpeg  ffmpeg for streaming your own videos (default: from PATH)
+//!   mpvlink-kbps=6000               bitrate of your stream
+//!
+//! In a room, the member list (top left) shows an arrow at whose stream you're
+//! watching; click a name to switch. With the arrow on yourself, a video you
+//! open (e.g. drag into the window) is streamed to the room.
 
 mod ass;
 mod ffi;
+mod ffmpeg;
 mod menu;
+mod mpegts;
 mod mpv;
 mod profile;
 mod room;
+mod roster;
 mod session;
 mod stream;
 
 use menu::{Action, Layout, Menu};
 use mpv::{Event, Mpv};
 use profile::Profile;
+use mpvlink_rtc::proto::PeerId;
 use session::{Session, SessionConfig, SessionEvent};
 use std::ffi::c_int;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-const OVERLAY_ID: &str = "1";
+/// osd-overlay ids. The menu draws over the member list.
+const MENU_OVERLAY: &str = "1";
+const ROSTER_OVERLAY: &str = "2";
+const SUBTITLE_OVERLAY: &str = "3";
 const OBSERVE_OSD: u64 = 1;
 const OBSERVE_MOUSE: u64 = 2;
+const OBSERVE_SUB: u64 = 3;
+const OBSERVE_IDLE: u64 = 4;
 
 const GLOBAL_SECTION: &str = "mpvlink-global";
 const MENU_SECTION: &str = "mpvlink-menu";
+const ROSTER_SECTION: &str = "mpvlink-roster";
+
+/// Bitrate of our own stream unless --script-opts says otherwise.
+const DEFAULT_KBPS: u32 = 6000;
 
 /// Client message the session uses to report back to the plugin thread.
 const SESSION_MESSAGE: &str = "mpvlink-session";
@@ -72,13 +93,35 @@ struct Plugin {
     caret_drawn: bool,
     /// The room we're in, if any.
     session: Option<Session>,
+    /// The member list as last drawn (for clicks), and the row under the mouse.
+    roster: Option<roster::Overlay>,
+    hover: Option<PeerId>,
+    /// The member list's click binding is on. Only while the mouse is over
+    /// the list, so clicks elsewhere still reach mpv and other scripts.
+    roster_clicks: bool,
+    /// The subtitle line of the stream we're watching, as drawn.
+    subtitle: String,
+    /// Counts finished seeks, for our stream to follow.
+    seeks: Arc<AtomicU64>,
 }
 
 impl Plugin {
     fn new(mpv: Mpv) -> Self {
         let profile_path = mpv.expand_path(profile::PROFILE_PATH);
         let profile = profile_path.as_deref().map(Profile::load).unwrap_or_default();
-        Self { mpv, menu: None, profile, profile_path, caret_drawn: false, session: None }
+        Self {
+            mpv,
+            menu: None,
+            profile,
+            profile_path,
+            caret_drawn: false,
+            session: None,
+            roster: None,
+            hover: None,
+            roster_clicks: false,
+            subtitle: String::new(),
+            seeks: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     fn log_err(&self, what: &str, r: mpv::Result<()>) {
@@ -97,6 +140,9 @@ impl Plugin {
         let contents = format!("Ctrl+j {}", self.binding("toggle-menu"));
         self.log_err("define-section", self.mpv.command(&["define-section", GLOBAL_SECTION, &contents, "default"]));
         self.log_err("enable-section", self.mpv.command(&["enable-section", GLOBAL_SECTION]));
+        // Enabled only while the mouse is over the member list.
+        let contents = format!("MBTN_LEFT {}", self.binding("roster-click"));
+        self.log_err("define-section", self.mpv.command(&["define-section", ROSTER_SECTION, &contents, "force"]));
     }
 
     fn open_menu(&mut self) {
@@ -136,9 +182,7 @@ impl Plugin {
         self.log_err("define-section", self.mpv.command(&["define-section", MENU_SECTION, &contents, "force"]));
         self.log_err("enable-section", self.mpv.command(&["enable-section", MENU_SECTION, "exclusive"]));
 
-        self.log_err("observe", self.mpv.observe(OBSERVE_OSD, "osd-dimensions"));
-        self.log_err("observe", self.mpv.observe(OBSERVE_MOUSE, "mouse-pos"));
-
+        self.set_roster_clicks(false);
         self.menu = Some(Menu::new(&self.profile.display_name));
         self.redraw();
     }
@@ -147,10 +191,8 @@ impl Plugin {
         let Some(menu) = self.menu.take() else { return };
         // Remember the name even on cancel, so reopening doesn't lose it.
         self.remember_name(menu.name().trim());
-        self.mpv.unobserve(OBSERVE_OSD);
-        self.mpv.unobserve(OBSERVE_MOUSE);
         self.log_err("disable-section", self.mpv.command(&["disable-section", MENU_SECTION]));
-        self.log_err("osd-overlay", self.mpv.command(&["osd-overlay", OVERLAY_ID, "none", ""]));
+        self.log_err("osd-overlay", self.mpv.command(&["osd-overlay", MENU_OVERLAY, "none", ""]));
     }
 
     /// Update the display name and save it for future launches. An empty name
@@ -183,6 +225,12 @@ impl Plugin {
 
     /// Mouse position in overlay coordinates, or None if it's outside the window.
     fn mouse(&self, layout: &Layout) -> Option<(f64, f64)> {
+        let (x, y) = self.mouse_pixels()?;
+        Some(layout.to_virtual(x, y))
+    }
+
+    /// Mouse position in window pixels, or None if it's outside the window.
+    fn mouse_pixels(&self) -> Option<(f64, f64)> {
         // mouse-pos doesn't support sub-property access (mouse-pos/x), so read
         // the whole thing; as a string it's JSON: {"x":10,"y":20,"hover":true}
         let json = self.mpv.get_string("mouse-pos")?;
@@ -191,7 +239,11 @@ impl Plugin {
         }
         let x = mpv::json_field(&json, "x")?.parse().ok()?;
         let y = mpv::json_field(&json, "y")?.parse().ok()?;
-        Some(layout.to_virtual(x, y))
+        Some((x, y))
+    }
+
+    fn osd_size(&self) -> (f64, f64) {
+        (self.mpv.get_f64("osd-dimensions/w").unwrap_or(0.0), self.mpv.get_f64("osd-dimensions/h").unwrap_or(0.0))
     }
 
     fn redraw(&mut self) {
@@ -201,7 +253,74 @@ impl Plugin {
         self.caret_drawn = menu.caret_visible();
         let (rx, ry) = (layout.res_x.to_string(), layout.res_y.to_string());
         // osd-overlay <id> <format> <data> <res_x> <res_y> <z>
-        let r = self.mpv.command(&["osd-overlay", OVERLAY_ID, "ass-events", &data, &rx, &ry, "0"]);
+        let r = self.mpv.command(&["osd-overlay", MENU_OVERLAY, "ass-events", &data, &rx, &ry, "1"]);
+        self.log_err("osd-overlay", r);
+    }
+
+    /// Draw (or, outside a room, remove) the member list in the top-left corner.
+    fn draw_roster(&mut self) {
+        let Some(session) = &self.session else {
+            self.log_err("osd-overlay", self.mpv.command(&["osd-overlay", ROSTER_OVERLAY, "none", ""]));
+            self.roster = None;
+            self.hover = None;
+            self.set_roster_clicks(false);
+            return;
+        };
+        let (w, h) = self.osd_size();
+        let state = session.room_state();
+        let out = roster::render(session.room(), &state, self.hover, w, h);
+        let (rx, ry) = (out.res_x.to_string(), out.res_y.to_string());
+        let r = self.mpv.command(&["osd-overlay", ROSTER_OVERLAY, "ass-events", &out.data, &rx, &ry, "0"]);
+        self.log_err("osd-overlay", r);
+        self.roster = Some(out);
+    }
+
+    /// The mouse moved: highlight the row under it, and take clicks only
+    /// while it's over the member list.
+    fn roster_mouse(&mut self) {
+        let Some(roster) = &self.roster else { return };
+        let (w, h) = self.osd_size();
+        let pos = self
+            .mouse_pixels()
+            .filter(|_| w > 0.0 && h > 0.0 && self.menu.is_none())
+            .map(|(x, y)| (x * f64::from(roster.res_x) / w, y * f64::from(roster.res_y) / h));
+        let over = pos.is_some_and(|p| roster.frame.contains(p));
+        let row = pos.and_then(|p| roster.row_at(p));
+        self.set_roster_clicks(over);
+        if row != self.hover {
+            self.hover = row;
+            self.draw_roster();
+        }
+    }
+
+    fn set_roster_clicks(&mut self, on: bool) {
+        if on == self.roster_clicks {
+            return;
+        }
+        self.roster_clicks = on;
+        let command = if on { "enable-section" } else { "disable-section" };
+        self.log_err(command, self.mpv.command(&[command, ROSTER_SECTION]));
+    }
+
+    /// Show the subtitle line of the stream we're watching ("" hides it).
+    fn draw_subtitle(&mut self, text: &str) {
+        self.subtitle = text.to_string();
+        if text.is_empty() {
+            self.log_err("osd-overlay", self.mpv.command(&["osd-overlay", SUBTITLE_OVERLAY, "none", ""]));
+            return;
+        }
+        // Styled like mpv's own subtitles: white with a black outline, bottom center.
+        let (w, h) = self.osd_size();
+        let res_y = 720.0;
+        let res_x = if w > 0.0 && h > 0.0 { (res_y * w / h).round() } else { 1280.0 };
+        let data = format!(
+            r"{{\an2\pos({:.0},{:.0})\fs38\bord2.5\shad0\1c&HFFFFFF&\3c&H000000&}}{}",
+            res_x / 2.0,
+            res_y - 30.0,
+            ass::escape(text)
+        );
+        let (rx, ry) = (res_x.to_string(), res_y.to_string());
+        let r = self.mpv.command(&["osd-overlay", SUBTITLE_OVERLAY, "ass-events", &data, &rx, &ry, "0"]);
         self.log_err("osd-overlay", r);
     }
 
@@ -309,14 +428,17 @@ impl Plugin {
         // Session events arrive on Tokio threads; bounce them to the plugin
         // thread as client messages so all mpv state changes happen here.
         let (remote, me) = (self.mpv.remote(), self.mpv.name().to_string());
-        let notify = std::sync::Arc::new(move |event: SessionEvent| {
-            let (kind, text) = match event {
-                SessionEvent::Status(t) => ("status", t),
-                SessionEvent::StreamStarted => ("started", String::new()),
-                SessionEvent::StreamEnded(t) => ("ended", t),
-                SessionEvent::Failed(t) => ("failed", t),
+        let notify = Arc::new(move |event: SessionEvent| {
+            let (kind, text, extra) = match event {
+                SessionEvent::Status(t) => ("status", t, String::new()),
+                SessionEvent::WatchStarted { peer, name } => ("watch", name, peer.to_string()),
+                SessionEvent::StreamEnded(t) => ("ended", t, String::new()),
+                SessionEvent::Failed(t) => ("failed", t, String::new()),
+                SessionEvent::RoomChanged => ("room", String::new(), String::new()),
+                SessionEvent::Subtitle(t) => ("sub", t, String::new()),
+                SessionEvent::StreamingFailed(t) => ("streamfail", t, String::new()),
             };
-            let _ = remote.command(&["script-message-to", &me, SESSION_MESSAGE, kind, &text]);
+            let _ = remote.command(&["script-message-to", &me, SESSION_MESSAGE, kind, &text, &extra]);
         });
         match Session::start(config, notify) {
             // Stay open when a stream ends, rather than quitting at EOF.
@@ -326,32 +448,95 @@ impl Plugin {
             }
             Err(e) => self.osd(&format!("Couldn't start the session: {e:#}"), 8000),
         }
+        self.draw_roster();
     }
 
-    /// ["mpvlink-session", kind, text] from the session's notify callback.
+    /// ["mpvlink-session", kind, text, extra] from the session's notify callback.
     fn on_session_message(&mut self, args: &[String]) {
         let kind = args.get(1).map(String::as_str).unwrap_or("");
         let text = args.get(2).map(String::as_str).unwrap_or("");
-        let Some(room) = self.session.as_ref().map(|s| s.room().to_string()) else { return };
+        let extra = args.get(3).map(String::as_str).unwrap_or("");
+        let Some(session) = &self.session else { return };
+        let room = session.room().to_string();
         match kind {
             "status" => self.osd(text, 4000),
-            "started" => {
-                let url = stream::url(&room);
+            "watch" => {
+                let Ok(peer) = extra.parse::<PeerId>() else { return };
+                // Stale if the user has switched to someone else since.
+                if session.room_state().target != Some(peer) {
+                    return;
+                }
+                let url = stream::url(&room, peer);
                 // A reconnect can bring a fresh offer for a stream we're already
                 // playing; its frames go into the same queue, so keep playing.
                 if self.mpv.get_string("path").as_deref() == Some(url.as_str()) {
                     return;
                 }
-                let options = LOW_LATENCY_OPTIONS.join(",") + &format!(",force-media-title=Room {room}");
+                let title = text.replace(',', " ");
+                let options = LOW_LATENCY_OPTIONS.join(",") + &format!(",force-media-title={title} — room {room}");
                 self.log_err("loadfile", self.mpv.command(&["loadfile", &url, "replace", "-1", &options]));
             }
-            "ended" => self.osd(text, 6000),
+            "ended" => {
+                self.draw_subtitle("");
+                self.osd(text, 6000);
+            }
+            "room" => self.draw_roster(),
+            "sub" => self.draw_subtitle(text),
+            "streamfail" => self.osd(&format!("Streaming stopped: {text}"), 10_000),
             "failed" => {
                 self.session = None;
+                self.draw_roster();
+                self.draw_subtitle("");
                 self.osd(&format!("Left room {room}: {text}"), 8000);
             }
             _ => {}
         }
+    }
+
+    /// A file finished loading. With the arrow on ourselves, stream it.
+    fn on_file_loaded(&mut self) {
+        let Some(session) = &self.session else { return };
+        let Some(path) = self.mpv.get_string("path") else { return };
+        if path.starts_with(&format!("{}://", stream::PROTOCOL)) || !session.room_state().targets_me() {
+            return;
+        }
+        let source = if let Some(rest) = path.strip_prefix("file://") {
+            rest.to_string()
+        } else if path.starts_with("http://") || path.starts_with("https://") {
+            path.clone()
+        } else if path.contains("://") {
+            self.osd("This kind of source can't be streamed (only files and http(s) links).", 6000);
+            return;
+        } else if Path::new(&path).is_absolute() {
+            path.clone()
+        } else {
+            let cwd = self.mpv.get_string("working-directory").unwrap_or_default();
+            Path::new(&cwd).join(&path).to_string_lossy().into_owned()
+        };
+        let remote = self.mpv.remote();
+        session.start_streaming(ffmpeg::StreamSource {
+            path: source,
+            title: self.mpv.get_string("media-title").unwrap_or(path),
+            ffmpeg: self.script_opt("mpvlink-ffmpeg").unwrap_or_else(|| "ffmpeg".into()),
+            kbps: self.script_opt("mpvlink-kbps").and_then(|k| k.parse().ok()).unwrap_or(DEFAULT_KBPS),
+            clock: Arc::new(move || remote.get_f64("time-pos")),
+            seeks: self.seeks.clone(),
+        });
+        self.send_subtitle();
+    }
+
+    fn streaming(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.room_state().me().is_some_and(|m| m.streaming))
+    }
+
+    /// While streaming, pass the subtitle line we see on to our viewers.
+    fn send_subtitle(&self) {
+        let Some(session) = &self.session else { return };
+        let text = match self.mpv.get_bool("sub-visibility") {
+            Some(false) => String::new(),
+            _ => self.mpv.get_string("sub-text").unwrap_or_default(),
+        };
+        session.subtitle(text);
     }
 
     /// A value from --script-opts (key=value,...), if set.
@@ -375,8 +560,15 @@ impl Plugin {
         (server, ice)
     }
 
+    /// Show a message at the top center (top-left is the member list's).
     fn osd(&self, text: &str, ms: u32) {
-        self.log_err("show-text", self.mpv.command(&["show-text", text, &ms.to_string()]));
+        // ${osd-ass-cc/0} turns on ASS tags for the rest of the text: \an8
+        // centers it at the top, and a slightly smaller size keeps longer
+        // messages clear of the member list. Client commands only expand ${...}
+        // when asked to, and "$$" keeps a literal $ from starting a property.
+        let text = format!(r"${{osd-ass-cc/0}}{{\an8\fscx80\fscy80}}{}", ass::escape(text).replace('$', "$$"));
+        let r = self.mpv.command(&["expand-properties", "show-text", &text, &ms.to_string()]);
+        self.log_err("show-text", r);
     }
 
     /// Handle a `key-binding` client message:
@@ -392,6 +584,12 @@ impl Plugin {
         match name {
             "toggle-menu" | "close-menu" => {
                 if self.menu.is_some() { self.close_menu() } else if name == "toggle-menu" { self.open_menu() }
+                return;
+            }
+            "roster-click" => {
+                if let (Some(session), Some(id)) = (&self.session, self.hover) {
+                    session.select(id);
+                }
                 return;
             }
             "settings" => {
@@ -427,13 +625,36 @@ impl Plugin {
 
     fn on_property_change(&mut self, id: u64) {
         match id {
-            OBSERVE_OSD => self.redraw(),
+            OBSERVE_OSD => {
+                self.redraw();
+                self.draw_roster();
+                let subtitle = self.subtitle.clone();
+                self.draw_subtitle(&subtitle);
+            }
             OBSERVE_MOUSE => {
-                let layout = self.layout();
-                let mouse = self.mouse(&layout);
-                if let Some(menu) = self.menu.as_mut() {
-                    let action = menu.mouse_move(mouse, &layout);
-                    self.apply(action);
+                if self.menu.is_some() {
+                    let layout = self.layout();
+                    let mouse = self.mouse(&layout);
+                    if let Some(menu) = self.menu.as_mut() {
+                        let action = menu.mouse_move(mouse, &layout);
+                        self.apply(action);
+                    }
+                } else {
+                    self.roster_mouse();
+                }
+            }
+            OBSERVE_SUB => {
+                if self.streaming() {
+                    self.send_subtitle();
+                }
+            }
+            // Nothing playing any more: nothing to stream.
+            OBSERVE_IDLE => {
+                if self.mpv.get_bool("idle-active") == Some(true)
+                    && self.streaming()
+                    && let Some(session) = &self.session
+                {
+                    session.stop_streaming();
                 }
             }
             _ => {}
@@ -444,6 +665,12 @@ impl Plugin {
         let r = self.mpv.add_stream_protocol(stream::PROTOCOL, stream::open);
         self.log_err("registering mpvlink:// protocol", r);
         self.install_global_bindings();
+        // The menu and member list are laid out for the window's size.
+        self.log_err("observe", self.mpv.observe(OBSERVE_OSD, "osd-dimensions"));
+        self.log_err("observe", self.mpv.observe(OBSERVE_MOUSE, "mouse-pos"));
+        self.log_err("observe", self.mpv.observe(OBSERVE_SUB, "sub-text"));
+        self.log_err("observe", self.mpv.observe(OBSERVE_SUB, "sub-visibility"));
+        self.log_err("observe", self.mpv.observe(OBSERVE_IDLE, "idle-active"));
         // Launched with nothing to play (e.g. `mpv --idle`): go straight to the menu.
         if self.mpv.get_bool("idle-active") == Some(true) {
             self.open_menu();
@@ -460,6 +687,10 @@ impl Plugin {
                     _ => {}
                 },
                 Event::PropertyChange { id } => self.on_property_change(id),
+                Event::FileLoaded => self.on_file_loaded(),
+                Event::PlaybackRestart => {
+                    self.seeks.fetch_add(1, Ordering::SeqCst);
+                }
                 _ => {}
             }
             if self.menu.as_ref().is_some_and(|m| m.caret_visible() != self.caret_drawn) {

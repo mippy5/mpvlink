@@ -932,12 +932,9 @@ name = "mpvlink-send"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
- "mpvlink-proto",
  "mpvlink-rtc",
  "openh264",
  "tokio",
- "webrtc",
 ]
 
 [[package]]
