@@ -8,11 +8,11 @@ use crate::stream::{self, FrameQueue};
 use anyhow::{Context, Result, bail};
 use mpvlink_rtc::h264::{FrameAssembler, is_keyframe};
 use mpvlink_rtc::peer::{self, ConnectionState, PeerEvent, new_peer_connection};
-use mpvlink_rtc::proto::{ClientMsg, PeerId, Role, ServerMsg, Signal};
+use mpvlink_rtc::proto::{PeerId, Role, ServerMsg, Signal};
 use mpvlink_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
 use mpvlink_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use mpvlink_rtc::rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
-use mpvlink_rtc::signaling::Signaling;
+use mpvlink_rtc::signaling::{JoinInfo, Signaling, SignalingEvent};
 use mpvlink_rtc::webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use mpvlink_rtc::webrtc::peer_connection::PeerConnection;
 use std::sync::Arc;
@@ -88,16 +88,46 @@ impl Drop for Session {
 }
 
 async fn run(config: SessionConfig, queue: Arc<FrameQueue>, notify: Notify) -> Result<()> {
-    let (signaling, mut incoming) = Signaling::connect(&config.server).await?;
-    signaling.send(ClientMsg::Join { room: config.room.clone(), name: config.name.clone(), role: Role::Viewer });
+    let join = JoinInfo { room: config.room.clone(), name: config.name.clone(), role: Role::Viewer };
+    let (signaling, mut incoming) = Signaling::connect(&config.server, join).await?;
 
     let mut publisher: Option<(PeerId, String)> = None;
     let mut receiver: Option<JoinHandle<()>> = None;
+    // Whether we've been welcomed at least once, and whether we're currently
+    // cut off from the signaling server (video keeps flowing peer to peer).
+    let (mut joined, mut reconnecting) = (false, false);
 
-    while let Some(msg) = incoming.recv().await {
+    while let Some(event) = incoming.recv().await {
+        let msg = match event {
+            SignalingEvent::Message(msg) => msg,
+            SignalingEvent::Disconnected { retry_in, .. } => {
+                reconnecting = true;
+                let video = if receiver.is_some() { " The stream keeps playing." } else { "" };
+                notify(SessionEvent::Status(format!(
+                    "Lost connection to the server. Reconnecting in {}s…{video}",
+                    retry_in.as_secs_f32().ceil()
+                )));
+                continue;
+            }
+        };
         match msg {
-            ServerMsg::Welcome { peers, .. } => {
-                publisher = peers.into_iter().find(|p| p.role == Role::Publisher).map(|p| (p.id, p.name));
+            ServerMsg::Welcome { peers, resumed, .. } => {
+                let found = peers.into_iter().find(|p| p.role == Role::Publisher).map(|p| (p.id, p.name));
+                if std::mem::replace(&mut reconnecting, false) {
+                    // Resumed: nothing changed. Otherwise (server restarted) ids
+                    // are new; the publisher will offer again, and until then the
+                    // current peer-to-peer stream keeps playing.
+                    if !resumed {
+                        publisher = found;
+                    }
+                    notify(SessionEvent::Status("Reconnected to the server.".into()));
+                    continue;
+                }
+                if joined {
+                    continue;
+                }
+                joined = true;
+                publisher = found;
                 notify(SessionEvent::Status(match &publisher {
                     Some((_, name)) => format!("Joined room {}. Connecting to {name}'s stream…", config.room),
                     None => format!("Joined room {}. Waiting for someone to start streaming…", config.room),
@@ -147,7 +177,7 @@ async fn run(config: SessionConfig, queue: Arc<FrameQueue>, notify: Notify) -> R
     if let Some(task) = receiver.take() {
         task.abort();
     }
-    bail!("Lost connection to the signaling server.")
+    bail!("Disconnected from the signaling server.")
 }
 
 /// One peer connection to the publisher.

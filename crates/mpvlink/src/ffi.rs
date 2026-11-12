@@ -1,7 +1,10 @@
 //! Raw bindings to the subset of <mpv/client.h> this plugin uses.
 //!
-//! The symbols are resolved from the mpv executable when it loads the plugin,
-//! so nothing here links against libmpv.
+//! Nothing here links against libmpv; mpv provides the functions when it loads
+//! the plugin. On macOS and Linux they're ordinary symbols resolved from the mpv
+//! executable at load time. Windows has no such lookup, so there the plugin
+//! exports a `pfn_<name>` function pointer per function, which mpv (0.37+) fills
+//! in before calling `mpv_open_cplugin` (`MPV_CPLUGIN_DYNAMIC_SYM` in client.h).
 
 #![allow(non_camel_case_types)]
 
@@ -73,7 +76,59 @@ pub struct mpv_stream_cb_info {
 pub type mpv_stream_cb_open_ro_fn =
     unsafe extern "C" fn(user_data: *mut c_void, uri: *mut c_char, info: *mut mpv_stream_cb_info) -> c_int;
 
-unsafe extern "C" {
+/// Declares the mpv functions this plugin calls: plain `extern` declarations on
+/// macOS/Linux, and on Windows exported `pfn_*` pointers plus same-named
+/// wrappers, so callers look the same on every platform.
+macro_rules! mpv_functions {
+    ($(pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?;)*) => {
+        #[cfg(not(windows))]
+        unsafe extern "C" {
+            $(pub fn $name($($arg: $ty),*) $(-> $ret)?;)*
+        }
+
+        /// The pointers mpv fills in, one module per function (modules and
+        /// functions live in different namespaces, so the names can match).
+        #[cfg(windows)]
+        mod slots {
+            use super::*;
+            $(
+                pub mod $name {
+                    use super::*;
+                    #[unsafe(export_name = concat!("pfn_", stringify!($name)))]
+                    pub static mut PTR: Option<unsafe extern "C" fn($($ty),*) $(-> $ret)?> = None;
+                }
+            )*
+        }
+
+        $(
+            #[cfg(windows)]
+            pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+                // SAFETY: mpv writes the pointer once, before mpv_open_cplugin
+                // runs; everything after only reads it.
+                let f = unsafe { slots::$name::PTR }
+                    .expect(concat!("mpv didn't provide ", stringify!($name)));
+                unsafe { f($($arg),*) }
+            }
+        )*
+
+        /// Whether mpv provided every function (always true off Windows, where
+        /// a missing symbol fails the load instead). Older mpv on Windows
+        /// doesn't fill the pointers in.
+        pub fn functions_available() -> bool {
+            #[cfg(windows)]
+            {
+                // SAFETY: see above; a plain read of each pointer.
+                true $(&& unsafe { slots::$name::PTR }.is_some())*
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        }
+    };
+}
+
+mpv_functions! {
     pub fn mpv_stream_cb_add_ro(
         ctx: *mut mpv_handle,
         protocol: *const c_char,

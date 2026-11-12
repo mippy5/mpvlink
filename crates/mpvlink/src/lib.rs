@@ -5,10 +5,12 @@
 //!
 //! Key bindings:
 //!   Ctrl+j                              toggle the join/create room menu (Tab switches fields)
-//!   script-binding mpvlink/toggle-menu  same, for use in input.conf
+//!   Ctrl+,                              (in the menu) open settings
+//!   script-binding mpvlink/toggle-menu  toggle the menu, for use in input.conf
+//!   script-binding mpvlink/settings     open the menu at the settings page
 //!
-//! Options (`--script-opts=key=value,...`):
-//!   mpvlink-server=ws://host:port   signaling server (default ws://127.0.0.1:8787)
+//! Options (`--script-opts=key=value,...`); these override saved settings:
+//!   mpvlink-server=wss://host       signaling server (default: saved setting, else ws://127.0.0.1:8787)
 //!   mpvlink-stun=stun:host:port     STUN server, or "no" for none (default: Google's public one)
 
 mod ass;
@@ -20,7 +22,7 @@ mod room;
 mod session;
 mod stream;
 
-use menu::{Action, JoinMenu, Layout};
+use menu::{Action, Layout, Menu};
 use mpv::{Event, Mpv};
 use profile::Profile;
 use session::{Session, SessionConfig, SessionEvent};
@@ -37,7 +39,8 @@ const MENU_SECTION: &str = "mpvlink-menu";
 /// Client message the session uses to report back to the plugin thread.
 const SESSION_MESSAGE: &str = "mpvlink-session";
 
-const DEFAULT_SERVER: &str = "ws://127.0.0.1:8787";
+/// Signaling server when none is configured: one running on this computer.
+pub(crate) const DEFAULT_SERVER: &str = "ws://127.0.0.1:8787";
 
 /// Per-file options for playing a room's stream with as little delay as mpv
 /// allows: raw H.264 with no probing or buffering, frames shown as soon as
@@ -59,7 +62,7 @@ const LOW_LATENCY_OPTIONS: &[&str] = &[
 
 struct Plugin {
     mpv: Mpv,
-    menu: Option<JoinMenu>,
+    menu: Option<Menu>,
     /// The saved identity (display name), loaded at startup.
     profile: Profile,
     /// Where the profile is saved; None if there's no state directory (e.g.
@@ -120,7 +123,8 @@ impl Plugin {
             format!("ENTER {}", b("submit")),
             format!("KP_ENTER {}", b("submit")),
             format!("ESC {}", b("close")),
-            format!("Ctrl+j {}", b("close")),
+            format!("Ctrl+j {}", b("close-menu")),
+            format!("Ctrl+, {}", b("settings")),
             format!("Ctrl+v {}", b("paste")),
             format!("Meta+v {}", b("paste")),
             format!("MBTN_LEFT {}", b("click")),
@@ -135,7 +139,7 @@ impl Plugin {
         self.log_err("observe", self.mpv.observe(OBSERVE_OSD, "osd-dimensions"));
         self.log_err("observe", self.mpv.observe(OBSERVE_MOUSE, "mouse-pos"));
 
-        self.menu = Some(JoinMenu::new(&self.profile.display_name));
+        self.menu = Some(Menu::new(&self.profile.display_name));
         self.redraw();
     }
 
@@ -156,17 +160,24 @@ impl Plugin {
             return;
         }
         self.profile.display_name = name.to_string();
+        self.save_profile();
+    }
+
+    fn save_profile(&self) {
         if let Some(path) = &self.profile_path
             && let Err(e) = self.profile.save(path)
         {
             eprintln!("[{}] saving profile to {} failed: {e}", self.mpv.name(), path.display());
+            self.osd(&format!("Couldn't save settings: {e}"), 5000);
         }
     }
 
     fn layout(&self) -> Layout {
+        let fields = self.menu.as_ref().map_or(0, Menu::field_count);
         Layout::new(
             self.mpv.get_f64("osd-dimensions/w").unwrap_or(0.0),
             self.mpv.get_f64("osd-dimensions/h").unwrap_or(0.0),
+            fields,
         )
     }
 
@@ -207,7 +218,44 @@ impl Plugin {
                 self.close_menu();
                 self.create_room(&name);
             }
+            Action::OpenSettings => {
+                let overridden_by = self.script_opt("mpvlink-server");
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.open_settings(&self.profile.server, overridden_by.as_deref());
+                }
+                self.redraw();
+            }
+            Action::CloseSettings => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.close_settings();
+                }
+                self.redraw();
+            }
+            Action::SaveSettings { server } => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.close_settings();
+                }
+                self.redraw();
+                self.save_server(server);
+            }
         }
+    }
+
+    /// Persist the signaling server setting ("" = default) and say where it applies.
+    fn save_server(&mut self, server: String) {
+        if server == self.profile.server {
+            return;
+        }
+        self.profile.server = server;
+        self.save_profile();
+        let effective = self.settings().0;
+        let mut msg = format!("Signaling server: {effective}");
+        if self.script_opt("mpvlink-server").is_some() {
+            msg.push_str("\n(--script-opts overrides the saved setting)");
+        } else if let Some(session) = &self.session {
+            msg.push_str(&format!("\nApplies the next time you join (still in room {}).", session.room()));
+        }
+        self.osd(&msg, 5000);
     }
 
     fn create_room(&mut self, name: &str) {
@@ -288,8 +336,13 @@ impl Plugin {
         match kind {
             "status" => self.osd(text, 4000),
             "started" => {
-                let options = LOW_LATENCY_OPTIONS.join(",") + &format!(",force-media-title=Room {room}");
                 let url = stream::url(&room);
+                // A reconnect can bring a fresh offer for a stream we're already
+                // playing; its frames go into the same queue, so keep playing.
+                if self.mpv.get_string("path").as_deref() == Some(url.as_str()) {
+                    return;
+                }
+                let options = LOW_LATENCY_OPTIONS.join(",") + &format!(",force-media-title=Room {room}");
                 self.log_err("loadfile", self.mpv.command(&["loadfile", &url, "replace", "-1", &options]));
             }
             "ended" => self.osd(text, 6000),
@@ -301,14 +354,20 @@ impl Plugin {
         }
     }
 
-    /// (signaling server URL, ICE server URLs) from --script-opts.
-    fn settings(&self) -> (String, Vec<String>) {
+    /// A value from --script-opts (key=value,...), if set.
+    fn script_opt(&self, key: &str) -> Option<String> {
         let opts = self.mpv.get_string("script-opts").unwrap_or_default();
-        let get = |key: &str| {
-            opts.split(',').find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v.to_string()))
-        };
-        let server = get("mpvlink-server").unwrap_or_else(|| DEFAULT_SERVER.to_string());
-        let ice = match get("mpvlink-stun").as_deref() {
+        opts.split(',').find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v.to_string()))
+    }
+
+    /// (signaling server URL, ICE server URLs). The server comes from
+    /// --script-opts, else the saved setting, else the default.
+    fn settings(&self) -> (String, Vec<String>) {
+        let server = self
+            .script_opt("mpvlink-server")
+            .or_else(|| (!self.profile.server.is_empty()).then(|| self.profile.server.clone()))
+            .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+        let ice = match self.script_opt("mpvlink-stun").as_deref() {
             Some("no" | "") => vec![],
             Some(url) => vec![url.to_string()],
             None => vec![mpvlink_rtc::peer::DEFAULT_STUN_SERVER.to_string()],
@@ -330,9 +389,19 @@ impl Plugin {
             return;
         }
 
-        if name == "toggle-menu" {
-            if self.menu.is_some() { self.close_menu() } else { self.open_menu() }
-            return;
+        match name {
+            "toggle-menu" | "close-menu" => {
+                if self.menu.is_some() { self.close_menu() } else if name == "toggle-menu" { self.open_menu() }
+                return;
+            }
+            "settings" => {
+                self.open_menu();
+                if !self.menu.as_ref().is_some_and(Menu::in_settings) {
+                    self.apply(Action::OpenSettings);
+                }
+                return;
+            }
+            _ => {}
         }
 
         let action = {
@@ -347,7 +416,7 @@ impl Plugin {
                 "next-field" => menu.focus_next(),
                 "prev-field" => menu.focus_prev(),
                 "submit" => menu.submit(),
-                "close" => Action::Close,
+                "close" => menu.escape(),
                 "paste" => menu.insert(clipboard.as_deref().unwrap_or("")),
                 "click" => mouse.map_or(Action::None, |pos| menu.click(pos, &layout)),
                 _ => Action::None,
@@ -407,6 +476,10 @@ impl Plugin {
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
 pub extern "C" fn mpv_open_cplugin(ctx: *mut ffi::mpv_handle) -> c_int {
+    if !ffi::functions_available() {
+        eprintln!("mpvlink: this mpv doesn't support C plugins on Windows (needs mpv 0.37 or newer)");
+        return -1;
+    }
     // SAFETY: ctx is the handle mpv gave us, and it's only used on this thread.
     let mpv = unsafe { Mpv::from_raw(ctx) };
     Plugin::new(mpv).run();

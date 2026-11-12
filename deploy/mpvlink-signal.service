@@ -1,0 +1,43 @@
+# systemd unit for the mpvlink signaling server.
+# Install: see docs/deploy.md. Listens on localhost only; Caddy terminates TLS
+# in front of it and is the only thing that should reach it.
+
+[Unit]
+Description=mpvlink signaling server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mpvlink-signal --listen 127.0.0.1:8787
+Restart=on-failure
+RestartSec=2
+
+# Each connection is a file descriptor; leave room for many idle viewers.
+LimitNOFILE=65536
+
+# Hardening. The server keeps no state on disk and only needs to accept TCP
+# connections, so it runs as a throwaway user with almost everything locked down.
+DynamicUser=yes
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

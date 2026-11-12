@@ -1,6 +1,7 @@
 {
   "version": "0.2.0",
   "configurations": [
+    // ---- macOS (CodeLLDB) ---------------------------------------------------
     {
       // Start mpv with nothing to play: the plugin opens the join menu right away.
       "name": "Debug mpv plugin (join menu)",
@@ -32,6 +33,45 @@
       "cwd": "${workspaceFolder}",
       "sourceLanguages": ["rust"],
       "console": "internalConsole"
+    },
+
+    // ---- Windows (Visual Studio debugger, from the C/C++ extension) ---------
+    // Needs the Rust MSVC toolchain (the default on Windows) plus Visual Studio
+    // Build Tools, and mpv 0.37 or newer. The build writes a .pdb next to
+    // mpvlink.dll, so breakpoints in src\*.rs bind once mpv loads the plugin.
+    {
+      "name": "Windows: Debug mpv plugin (join menu)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "preLaunchTask": "build plugin (debug)",
+      "program": "${input:mpvExe}",
+      "args": [
+        "--script=${workspaceFolder}\\target\\debug\\mpvlink.dll",
+        "--log-file=${workspaceFolder}\\target\\debug\\mpv.log",
+        "--idle=yes"
+      ],
+      "cwd": "${workspaceFolder}",
+      // mpv.exe is a GUI program with no terminal here, so mpv's own messages
+      // go to a log file instead. The plugin's println!/eprintln! output isn't
+      // captured; use breakpoints, or watch the OSD messages.
+      "console": "internalConsole",
+      "symbolOptions": { "searchPaths": ["${workspaceFolder}\\target\\debug"] }
+    },
+    {
+      "name": "Windows: Debug mpv plugin (play media)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "preLaunchTask": "build plugin (debug)",
+      "program": "${input:mpvExe}",
+      "args": [
+        "--script=${workspaceFolder}\\target\\debug\\mpvlink.dll",
+        "--log-file=${workspaceFolder}\\target\\debug\\mpv.log",
+        "--keep-open=yes",
+        "${input:media}"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole",
+      "symbolOptions": { "searchPaths": ["${workspaceFolder}\\target\\debug"] }
     }
   ],
   "inputs": [
@@ -40,6 +80,14 @@
       "type": "promptString",
       "description": "File or URL to play (the default is a generated test video)",
       "default": "av://lavfi:testsrc=duration=60"
+    },
+    {
+      // Windows mpv builds don't install to a fixed place. Change the default
+      // to where your mpv.exe is so you can just press Enter.
+      "id": "mpvExe",
+      "type": "promptString",
+      "description": "Path to mpv.exe (0.37 or newer)",
+      "default": "C:\\Program Files\\mpv\\mpv.exe"
     }
   ]
 }

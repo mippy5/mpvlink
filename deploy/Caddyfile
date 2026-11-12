@@ -1,0 +1,14 @@
+# Caddy config for the mpvlink signaling server. Replace the domain with yours;
+# Caddy gets and renews the TLS certificate automatically (ports 80 and 443
+# must be reachable). WebSocket upgrades are proxied with no extra config.
+#
+# Clients then use: wss://signal.example.com
+
+signal.example.com {
+	reverse_proxy 127.0.0.1:8787 {
+		# On `caddy reload`, let existing WebSocket connections finish for a
+		# while instead of cutting them all at once. mpvlink clients reconnect
+		# and resume on their own either way, and video isn't affected.
+		stream_close_delay 5m
+	}
+}

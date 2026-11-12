@@ -5,6 +5,9 @@
       "label": "build plugin (debug)",
       "type": "shell",
       "command": "make build PROFILE=debug",
+      // On Windows, cargo already names the output mpvlink.dll, the name mpv
+      // wants, so there's nothing to copy: target\debug\mpvlink.dll.
+      "windows": { "command": "cargo build -p mpvlink" },
       "group": { "kind": "build", "isDefault": true },
       "problemMatcher": ["$rustc"]
     },
@@ -12,6 +15,7 @@
       "label": "build plugin (release)",
       "type": "shell",
       "command": "make build",
+      "windows": { "command": "cargo build -p mpvlink --release" },
       "group": "build",
       "problemMatcher": ["$rustc"]
     }

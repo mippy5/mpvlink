@@ -1,0 +1,24 @@
+# Caddy config for serving the signaling server on a bare IP address, using a
+# Let's Encrypt IP certificate that certbot obtains (see docs/deploy.md,
+# "Using an IP address instead of a domain"). Replace 203.0.113.5 with your
+# server's IP (for IPv6, use the bracketed form, e.g. [2001:db8::1]).
+#
+# Clients then use: wss://203.0.113.5
+
+# Port 80: serves certbot's HTTP challenge files (webroot method).
+http://203.0.113.5 {
+	root * /var/www/acme
+	file_server
+}
+
+# Port 443: the signaling server, with the certificate certbot's deploy hook
+# copies into /etc/caddy/certs.
+203.0.113.5 {
+	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
+	reverse_proxy 127.0.0.1:8787 {
+		# On reload (every few days, after each renewal), let existing
+		# connections finish for a while instead of cutting them all at once.
+		# Clients reconnect and resume on their own either way.
+		stream_close_delay 5m
+	}
+}

@@ -13,5 +13,7 @@ futures-util.workspace = true
 rtc.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
+rustls.workspace = true
+# wss:// with Mozilla's root certificates bundled (no system dependency).
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 webrtc.workspace = true

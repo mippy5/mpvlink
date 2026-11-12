@@ -14,6 +14,8 @@ pub const PROFILE_PATH: &str = "~~state/mpvlink/profile";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Profile {
     pub display_name: String,
+    /// Signaling server URL; empty means the default.
+    pub server: String,
 }
 
 impl Profile {
@@ -40,20 +42,29 @@ impl Profile {
             if line.starts_with('#') {
                 continue;
             }
-            if let Some((key, value)) = line.split_once('=')
-                && key.trim() == "name"
-            {
-                profile.display_name = value.trim().to_string();
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let value = value.trim().to_string();
+            match key.trim() {
+                "name" => profile.display_name = value,
+                "server" => profile.server = value,
+                _ => {}
             }
         }
         profile
     }
 
     fn serialize(&self) -> String {
-        // Names never contain newlines (the menu turns whitespace into
-        // spaces), but strip them anyway so one can't inject extra keys.
-        let name: String = self.display_name.chars().filter(|c| !c.is_control()).collect();
-        format!("# mpvlink profile\nname={}\n", name.trim())
+        // Values never contain newlines (the menus filter them out), but strip
+        // control characters anyway so one value can't inject extra keys.
+        let clean = |v: &str| v.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string();
+        let mut out = String::from("# mpvlink profile\n");
+        for (key, value) in [("name", &self.display_name), ("server", &self.server)] {
+            let value = clean(value);
+            if !value.is_empty() {
+                out.push_str(&format!("{key}={value}\n"));
+            }
+        }
+        out
     }
 }
 
@@ -63,8 +74,11 @@ mod tests {
 
     #[test]
     fn round_trips_through_text() {
-        let p = Profile { display_name: "Zoë = the {cat}".into() };
+        let p = Profile { display_name: "Zoë = the {cat}".into(), server: "wss://signal.example.com:8443/x?a=b".into() };
         assert_eq!(Profile::parse(&p.serialize()), p);
+        let no_server = Profile { display_name: "Ana".into(), server: String::new() };
+        assert!(!no_server.serialize().contains("server="), "default isn't written");
+        assert_eq!(Profile::parse(&no_server.serialize()), no_server);
     }
 
     #[test]
@@ -76,7 +90,7 @@ mod tests {
 
     #[test]
     fn serialize_strips_newlines() {
-        let p = Profile { display_name: "Ana\nname=Evil".into() };
+        let p = Profile { display_name: "Ana\nname=Evil".into(), server: String::new() };
         assert_eq!(Profile::parse(&p.serialize()).display_name, "Ananame=Evil");
     }
 
@@ -86,7 +100,7 @@ mod tests {
         let path = dir.join("nested/profile");
         assert_eq!(Profile::load(&path), Profile::default(), "missing file loads empty");
 
-        let p = Profile { display_name: "Dana".into() };
+        let p = Profile { display_name: "Dana".into(), server: "wss://x.example".into() };
         p.save(&path).unwrap();
         assert_eq!(Profile::load(&path), p);
         assert!(!path.with_extension("tmp").exists());

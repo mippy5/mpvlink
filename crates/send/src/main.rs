@@ -15,12 +15,12 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use mpvlink_rtc::h264::normalize_start_codes;
 use mpvlink_rtc::peer::{self, ConnectionState, PeerEvent, h264_codec, new_peer_connection, random_ssrc};
-use mpvlink_rtc::proto::{ClientMsg, PeerId, Role, ServerMsg, Signal, normalize_name, normalize_room};
+use mpvlink_rtc::proto::{PeerId, Role, ServerMsg, Signal, normalize_name, normalize_room};
 use mpvlink_rtc::rtc::media::Sample;
 use mpvlink_rtc::rtc::media_stream::MediaStreamTrack;
 use mpvlink_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
 use mpvlink_rtc::rtc::rtp_transceiver::rtp_sender::{RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
-use mpvlink_rtc::signaling::Signaling;
+use mpvlink_rtc::signaling::{JoinInfo, Signaling, SignalingEvent};
 use mpvlink_rtc::webrtc::media_stream::track_local::TrackLocal;
 use mpvlink_rtc::webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use mpvlink_rtc::webrtc::peer_connection::PeerConnection;
@@ -57,8 +57,8 @@ struct Frame {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Arc::new(parse_args()?);
-    let (signaling, mut incoming) = Signaling::connect(&args.server).await?;
-    signaling.send(ClientMsg::Join { room: args.room.clone(), name: args.name.clone(), role: Role::Publisher });
+    let join = JoinInfo { room: args.room.clone(), name: args.name.clone(), role: Role::Publisher };
+    let (signaling, mut incoming) = Signaling::connect(&args.server, join).await?;
 
     // Encoder runs on its own thread; frames fan out to viewers.
     let (frames_tx, _) = broadcast::channel::<Frame>(8);
@@ -98,17 +98,42 @@ async fn main() -> Result<()> {
         (task, answer_tx)
     };
 
+    let mut welcomed = false;
     loop {
-        let msg = tokio::select! {
-            msg = incoming.recv() => msg,
+        let event = tokio::select! {
+            event = incoming.recv() => event,
             _ = tokio::signal::ctrl_c() => break,
         };
-        let Some(msg) = msg else { bail!("lost connection to the signaling server") };
+        let msg = match event {
+            Some(SignalingEvent::Message(msg)) => msg,
+            Some(SignalingEvent::Disconnected { error, retry_in }) => {
+                println!(
+                    "Lost connection to the signaling server ({error}); retrying in {:.1}s. Streams keep going.",
+                    retry_in.as_secs_f32()
+                );
+                continue;
+            }
+            None => bail!("disconnected from the signaling server"),
+        };
         match msg {
-            ServerMsg::Welcome { you, peers } => {
-                println!("Streaming to room {} as {} (peer {you}). Waiting for viewers…", args.room, args.name);
+            ServerMsg::Welcome { you, peers, resumed } => {
+                if !welcomed {
+                    println!("Streaming to room {} as {} (peer {you}). Waiting for viewers…", args.room, args.name);
+                } else if resumed {
+                    println!("Reconnected to the signaling server.");
+                } else {
+                    // The server lost its state (restarted): everyone has new
+                    // ids, so start over with whoever is in the room now.
+                    println!("Reconnected to the signaling server (fresh session, peer {you}); reconnecting viewers.");
+                    for (_, (task, _)) in viewers.drain() {
+                        task.abort();
+                    }
+                }
+                welcomed = true;
+                // After a resume, anyone who joined meanwhile was announced via
+                // queued messages; this only catches what we don't know yet.
                 for p in peers.into_iter().filter(|p| p.role == Role::Viewer) {
-                    viewers.insert(p.id, spawn_viewer(p.id, p.name));
+                    viewers.entry(p.id).or_insert_with(|| spawn_viewer(p.id, p.name));
                 }
             }
             ServerMsg::PeerJoined { peer } if peer.role == Role::Viewer => {

@@ -30,7 +30,7 @@ pub fn generate_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::menu::{MAX_CODE_LEN, MIN_CODE_LEN};
+    use mpvlink_proto::{MAX_ROOM_LEN as MAX_CODE_LEN, MIN_ROOM_LEN as MIN_CODE_LEN};
 
     #[test]
     fn codes_use_the_alphabet_and_are_joinable() {

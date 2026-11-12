@@ -15,6 +15,9 @@ bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 openh264 = "0.9"
 rtc = "0.21"
+# TLS for wss:// signaling. ring (not aws-lc-rs): no CMake needed, cross-compiles cleanly,
+# and webrtc already uses it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
