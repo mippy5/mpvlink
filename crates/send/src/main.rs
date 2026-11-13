@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     let join = JoinInfo { room: args.room.clone(), name: args.name.clone(), streaming: true };
     let (signaling, mut incoming) = Signaling::connect(&args.server, join).await?;
     let log = Arc::new(|line: String| println!("{line}"));
-    let mut publisher = Publisher::new(signaling.clone(), args.ice_servers.clone(), log);
+    let mut publisher = Publisher::new(signaling.clone(), args.ice_servers.clone(), false, log);
 
     // Encoder runs on its own thread; frames fan out to viewers.
     {

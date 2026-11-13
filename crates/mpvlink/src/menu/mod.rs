@@ -8,7 +8,7 @@ mod join;
 mod settings;
 
 pub use join::JoinMenu;
-pub use settings::SettingsMenu;
+pub use settings::{SettingsContext, SettingsField, SettingsMenu, SettingsValues};
 
 use crate::ass::{Ass, Color, Rect, TextStyle, escape, span};
 use std::time::Instant;
@@ -60,8 +60,8 @@ pub enum Action {
     OpenSettings,
     /// Leave the settings page without saving.
     CloseSettings,
-    /// Save settings and go back. An empty server means "use the default".
-    SaveSettings { server: String },
+    /// Save settings and go back. Empty values mean "use the default".
+    SaveSettings { values: SettingsValues },
 }
 
 // ---- Layout -----------------------------------------------------------------
@@ -326,10 +326,16 @@ impl Menu {
         self.join.name()
     }
 
-    /// Show the settings page. `server` is the saved server ("" = default);
-    /// `overridden_by` is the server from --script-opts, which takes precedence.
-    pub fn open_settings(&mut self, server: &str, overridden_by: Option<&str>) {
-        self.settings = Some(SettingsMenu::new(server, overridden_by));
+    /// Show the settings page with the saved `values` ("" = default).
+    pub fn open_settings(&mut self, values: &SettingsValues, context: SettingsContext) {
+        self.settings = Some(SettingsMenu::new(values, context));
+    }
+
+    /// The plugin found a problem with a setting: show it, stay on the page.
+    pub fn reject_setting(&mut self, field: SettingsField, message: String) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.reject(field, message);
+        }
     }
 
     pub fn close_settings(&mut self) {
@@ -436,8 +442,9 @@ mod tests {
         let mut m = Menu::new("Ana");
         m.insert("room1");
         assert_eq!(m.field_count(), 2);
-        m.open_settings("wss://old.example", None);
-        assert_eq!(m.field_count(), 1);
+        let values = SettingsValues { server: "wss://old.example".into(), ffmpeg: String::new() };
+        m.open_settings(&values, SettingsContext { ffmpeg_found: Err(String::new()), ..Default::default() });
+        assert_eq!(m.field_count(), 2);
         m.insert("/x"); // goes to the settings field, not the room code
         assert_eq!(m.escape(), Action::CloseSettings);
         m.close_settings();

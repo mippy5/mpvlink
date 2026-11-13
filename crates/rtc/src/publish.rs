@@ -1,8 +1,8 @@
 //! The streaming side: one peer connection per viewer who asked to watch,
-//! all fed from the same stream of encoded frames.
+//! all fed from the same stream of encoded video frames and audio packets.
 
 use crate::h264::normalize_start_codes;
-use crate::peer::{self, ConnectionState, PeerEvent, h264_codec, new_peer_connection, random_ssrc};
+use crate::peer::{self, ConnectionState, PeerEvent, h264_codec, new_peer_connection, opus_codec, random_ssrc};
 use crate::signaling::Signaling;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -21,20 +21,34 @@ use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::peer_connection::PeerConnection;
 
-/// One encoded frame (Annex B), shared by all viewers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Media {
+    Video,
+    Audio,
+}
+
+/// One encoded video frame (Annex B) or Opus packet, shared by all viewers.
 #[derive(Clone, Debug)]
 pub struct Frame {
+    pub media: Media,
     pub data: Bytes,
+    /// For video: decoding can start here.
     pub keyframe: bool,
-    /// How long it's shown; advances the RTP timestamp.
+    /// How long it lasts; advances the RTP timestamp.
     pub duration: Duration,
 }
 
 impl Frame {
-    /// From an Annex B access unit. Access unit delimiters are dropped: the
-    /// receiver adds its own after each frame.
+    /// A video frame from an Annex B access unit. Access unit delimiters are
+    /// dropped: the receiver adds its own after each frame.
     pub fn new(annex_b: &[u8], keyframe: bool, duration: Duration) -> Self {
-        Self { data: normalize_start_codes(annex_b, &[NAL_ACCESS_UNIT_DELIMITER]), keyframe, duration }
+        let data = normalize_start_codes(annex_b, &[NAL_ACCESS_UNIT_DELIMITER]);
+        Self { media: Media::Video, data, keyframe, duration }
+    }
+
+    /// An Opus packet.
+    pub fn audio(packet: &[u8], duration: Duration) -> Self {
+        Self { media: Media::Audio, data: Bytes::copy_from_slice(packet), keyframe: true, duration }
     }
 }
 
@@ -43,9 +57,9 @@ const NAL_ACCESS_UNIT_DELIMITER: u8 = 9;
 /// Progress messages, for whoever is running the publisher to show or log.
 pub type Log = Arc<dyn Fn(String) + Send + Sync>;
 
-/// Frames that a viewer's sender can fall behind by before it skips ahead
-/// to the next keyframe.
-const FRAME_BUFFER: usize = 16;
+/// Frames (video and audio) that a viewer's sender can fall behind by before
+/// it skips ahead to the next keyframe: about half a second.
+const FRAME_BUFFER: usize = 48;
 
 struct Watcher {
     task: JoinHandle<()>,
@@ -57,18 +71,23 @@ pub struct Publisher {
     frames: broadcast::Sender<Frame>,
     keyframe_wanted: Arc<AtomicBool>,
     ice_servers: Vec<String>,
+    /// Offer an audio track too.
+    audio: bool,
     log: Log,
     watchers: HashMap<PeerId, Watcher>,
 }
 
 impl Publisher {
-    pub fn new(signaling: Signaling, ice_servers: Vec<String>, log: Log) -> Self {
+    /// `audio`: whether this stream can carry audio (viewers get an audio
+    /// track; it's fine if no packets ever arrive on it).
+    pub fn new(signaling: Signaling, ice_servers: Vec<String>, audio: bool, log: Log) -> Self {
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
         Self {
             signaling,
             frames,
             keyframe_wanted: Arc::new(AtomicBool::new(true)),
             ice_servers,
+            audio,
             log,
             watchers: HashMap::new(),
         }
@@ -113,6 +132,7 @@ impl Publisher {
             frames: self.frames.clone(),
             keyframe_wanted: self.keyframe_wanted.clone(),
             ice_servers: self.ice_servers.clone(),
+            audio: self.audio,
             log: self.log.clone(),
         };
         let log = self.log.clone();
@@ -159,7 +179,42 @@ struct ViewerCtx {
     frames: broadcast::Sender<Frame>,
     keyframe_wanted: Arc<AtomicBool>,
     ice_servers: Vec<String>,
+    audio: bool,
     log: Log,
+}
+
+/// An outgoing track and what's needed to write to it.
+struct Outgoing {
+    track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
+    payload_type: u8,
+}
+
+impl Outgoing {
+    async fn write(&self, frame: Frame) -> Result<()> {
+        let sample = Sample { data: frame.data, duration: frame.duration, ..Sample::new(Instant::now()) };
+        self.track.sample_writer(self.ssrc, self.payload_type).write_sample(&sample).await?;
+        Ok(())
+    }
+}
+
+fn local_track(kind: RtpCodecKind, id: &str, codec: rtc::rtp_transceiver::rtp_sender::RTCRtpCodec) -> Result<(Arc<TrackLocalStaticSample>, u32)> {
+    let ssrc = random_ssrc();
+    let track = TrackLocalStaticSample::new(
+        Instant::now(),
+        MediaStreamTrack::new(
+            "mpvlink".to_string(),
+            format!("mpvlink-{id}"),
+            format!("mpvlink {id}"),
+            kind,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
+                codec,
+                ..Default::default()
+            }],
+        ),
+    )?;
+    Ok((Arc::new(track), ssrc))
 }
 
 /// Offer our video to one viewer, then forward encoded frames to them until
@@ -167,22 +222,15 @@ struct ViewerCtx {
 async fn serve_viewer(ctx: ViewerCtx, mut answers: mpsc::UnboundedReceiver<String>) -> Result<()> {
     let (pc, mut events) = new_peer_connection(&ctx.ice_servers).await?;
 
-    let ssrc = random_ssrc();
-    let track = Arc::new(TrackLocalStaticSample::new(
-        Instant::now(),
-        MediaStreamTrack::new(
-            "mpvlink".to_string(),
-            "mpvlink-video".to_string(),
-            "mpvlink video".to_string(),
-            RtpCodecKind::Video,
-            vec![RTCRtpEncodingParameters {
-                rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
-                codec: h264_codec(),
-                ..Default::default()
-            }],
-        ),
-    )?);
-    let sender = pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>).await?;
+    let (video_track, video_ssrc) = local_track(RtpCodecKind::Video, "video", h264_codec())?;
+    let video_sender = pc.add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal>).await?;
+    let audio = if ctx.audio {
+        let (track, ssrc) = local_track(RtpCodecKind::Audio, "audio", opus_codec())?;
+        let sender = pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>).await?;
+        Some((track, ssrc, sender))
+    } else {
+        None
+    };
 
     let offer = pc.create_offer(None).await?;
     pc.set_local_description(offer).await?;
@@ -207,31 +255,38 @@ async fn serve_viewer(ctx: ViewerCtx, mut answers: mpsc::UnboundedReceiver<Strin
     }
     (ctx.log)(format!("{} ({}) is watching", ctx.name, ctx.id));
 
-    let payload_type = sender
-        .get_parameters()
-        .await?
-        .rtp_parameters
-        .codecs
-        .first()
-        .map(|c| c.payload_type)
-        .context("no negotiated codec")?;
+    let negotiated = |params: rtc::rtp_transceiver::rtp_sender::RTCRtpSendParameters| {
+        params.rtp_parameters.codecs.first().map(|c| c.payload_type).context("no negotiated codec")
+    };
+    let video = Outgoing {
+        payload_type: negotiated(video_sender.get_parameters().await?)?,
+        track: video_track,
+        ssrc: video_ssrc,
+    };
+    let audio = match audio {
+        Some((track, ssrc, sender)) => Some(Outgoing { payload_type: negotiated(sender.get_parameters().await?)?, track, ssrc }),
+        None => None,
+    };
 
-    // Start them on a keyframe; skip frames until one comes.
+    // Start them on a keyframe; skip video frames until one comes. Audio
+    // needs no such start, so it flows right away.
     let mut frames = ctx.frames.subscribe();
     ctx.keyframe_wanted.store(true, Ordering::Relaxed);
     let mut waiting_for_keyframe = true;
     loop {
         tokio::select! {
             frame = frames.recv() => match frame {
+                Ok(frame) if frame.media == Media::Audio => {
+                    if let Some(audio) = &audio {
+                        audio.write(frame).await?;
+                    }
+                }
                 Ok(frame) => {
                     if waiting_for_keyframe && !frame.keyframe {
                         continue;
                     }
                     waiting_for_keyframe = false;
-                    track
-                        .sample_writer(ssrc, payload_type)
-                        .write_sample(&Sample { data: frame.data, duration: frame.duration, ..Sample::new(Instant::now()) })
-                        .await?;
+                    video.write(frame).await?;
                 }
                 // We fell behind and frames were dropped: resync on a keyframe.
                 Err(broadcast::error::RecvError::Lagged(_)) => {

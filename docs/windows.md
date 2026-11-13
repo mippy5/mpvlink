@@ -51,8 +51,8 @@ may communicate on the network. Allow it (at least on private networks), or
 video may not arrive when the person streaming is on another network.
 
 To stream your own videos you also need ffmpeg (see
-[streaming.md](streaming.md)): put `ffmpeg.exe` on your PATH, or set
-`script-opts-append=mpvlink-ffmpeg=C:\path\to\ffmpeg.exe` in `mpv.conf`.
+[streaming.md](streaming.md)): put `ffmpeg.exe` on your PATH, or enter its
+path (e.g. `C:\ffmpeg\bin\ffmpeg.exe`) in Settings under **ffmpeg**.
 NVIDIA (NVENC) and Intel (Quick Sync) hardware encoders are used when present;
 those two haven't been tested yet, and ffmpeg falls back to x264 if they fail
 to start.

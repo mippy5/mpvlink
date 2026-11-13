@@ -1,5 +1,6 @@
 //! Just enough MPEG-TS to read ffmpeg's output: the video stream's frames
-//! (one PES packet each) and their presentation timestamps.
+//! (one PES packet each), the Opus audio stream's packets, and their
+//! presentation timestamps.
 //!
 //! ffmpeg writes raw H.264 without timestamps, so the stream is wrapped in
 //! MPEG-TS instead: that's how each frame's position in the file gets here,
@@ -8,24 +9,39 @@
 const PACKET: usize = 188;
 const SYNC: u8 = 0x47;
 
-/// A video frame (Annex B H.264) and its timestamp in 90 kHz units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// An H.264 access unit (Annex B).
+    Video,
+    /// One Opus packet.
+    Audio,
+}
+
+/// A frame and its timestamp in 90 kHz units.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TsFrame {
+    pub kind: Kind,
     pub pts: i64,
     pub data: Vec<u8>,
+}
+
+/// One elementary stream being collected.
+#[derive(Default)]
+struct Stream {
+    pid: Option<u16>,
+    /// The PES being collected, and its timestamp.
+    pes: Vec<u8>,
+    pts: Option<i64>,
+    /// Last timestamp, for unwrapping the 33-bit counter.
+    last_pts: Option<i64>,
 }
 
 #[derive(Default)]
 pub struct TsDemuxer {
     /// Bytes not yet forming a whole packet.
     pending: Vec<u8>,
-    /// The PID carrying video, once seen.
-    video_pid: Option<u16>,
-    /// The frame being collected, and its timestamp.
-    pes: Vec<u8>,
-    pts: Option<i64>,
-    /// Last timestamp, for unwrapping the 33-bit counter.
-    last_pts: Option<i64>,
+    video: Stream,
+    audio: Stream,
 }
 
 impl TsDemuxer {
@@ -69,58 +85,138 @@ impl TsDemuxer {
         }
         let payload = &p[start..];
 
-        let is_video_pes = unit_start && payload.len() > 3 && payload[..3] == [0, 0, 1] && (0xE0..=0xEF).contains(&payload[3]);
-        if self.video_pid.is_none() && is_video_pes {
-            self.video_pid = Some(pid);
+        // Find the streams by their first PES: video has stream ids E0-EF;
+        // ffmpeg puts Opus in private stream 1 (BD), each packet starting with
+        // an Opus control header (0x7FE0, 11 bits set).
+        let pes_start = unit_start && payload.len() > 9 && payload[..3] == [0, 0, 1];
+        if pes_start && self.video.pid.is_none() && (0xE0..=0xEF).contains(&payload[3]) {
+            self.video.pid = Some(pid);
         }
-        if self.video_pid != Some(pid) {
+        if pes_start && self.audio.pid.is_none() && payload[3] == 0xBD {
+            let data = &payload[(9 + usize::from(payload[8])).min(payload.len())..];
+            if data.len() >= 2 && data[0] == 0x7F && data[1] & 0xE0 == 0xE0 {
+                self.audio.pid = Some(pid);
+            }
+        }
+        let kind = if self.video.pid == Some(pid) {
+            Kind::Video
+        } else if self.audio.pid == Some(pid) {
+            Kind::Audio
+        } else {
             return;
-        }
+        };
+        let stream = match kind {
+            Kind::Video => &mut self.video,
+            Kind::Audio => &mut self.audio,
+        };
         if unit_start {
-            self.emit(out);
-            if !is_video_pes || payload.len() < 9 {
+            emit(kind, stream, out);
+            if !pes_start {
                 return;
             }
             let flags = payload[7];
             let header_end = 9 + usize::from(payload[8]);
             if flags & 0x80 != 0 && payload.len() >= 14 {
-                self.pts = Some(self.unwrap(parse_timestamp(&payload[9..14])));
+                stream.pts = Some(unwrap(&mut stream.last_pts, parse_timestamp(&payload[9..14])));
             }
             if header_end <= payload.len() {
-                self.pes.extend_from_slice(&payload[header_end..]);
+                stream.pes.extend_from_slice(&payload[header_end..]);
             }
         } else {
-            self.pes.extend_from_slice(payload);
+            stream.pes.extend_from_slice(payload);
         }
     }
 
     fn emit(&mut self, out: &mut Vec<TsFrame>) {
-        let data = std::mem::take(&mut self.pes);
-        if let Some(pts) = self.pts.take()
-            && !data.is_empty()
-        {
-            out.push(TsFrame { pts, data });
+        emit(Kind::Video, &mut self.video, out);
+        emit(Kind::Audio, &mut self.audio, out);
+    }
+}
+
+/// A finished PES: a video frame, or one or more Opus packets.
+fn emit(kind: Kind, stream: &mut Stream, out: &mut Vec<TsFrame>) {
+    let data = std::mem::take(&mut stream.pes);
+    let Some(pts) = stream.pts.take() else { return };
+    if data.is_empty() {
+        return;
+    }
+    match kind {
+        Kind::Video => out.push(TsFrame { kind, pts, data }),
+        Kind::Audio => {
+            // Later packets in the same PES follow on from the first.
+            let mut pts = pts;
+            for packet in opus_packets(&data) {
+                let duration = opus_samples(packet).unwrap_or(960) as i64 * 90_000 / 48_000;
+                out.push(TsFrame { kind, pts, data: packet.to_vec() });
+                pts += duration;
+            }
         }
     }
+}
 
-    /// Timestamps are 33-bit and wrap (every ~26.5 hours); keep them increasing.
-    fn unwrap(&mut self, raw: i64) -> i64 {
-        const WRAP: i64 = 1 << 33;
-        let pts = match self.last_pts {
-            Some(last) => {
-                let base = last - last.rem_euclid(WRAP);
-                // The candidate closest to the last timestamp.
-                [base - WRAP, base, base + WRAP]
-                    .into_iter()
-                    .map(|b| b + raw)
-                    .min_by_key(|p| (p - last).abs())
-                    .unwrap_or(raw)
+/// Timestamps are 33-bit and wrap (every ~26.5 hours); keep them increasing.
+fn unwrap(last: &mut Option<i64>, raw: i64) -> i64 {
+    const WRAP: i64 = 1 << 33;
+    let pts = match *last {
+        Some(prev) => {
+            let base = prev - prev.rem_euclid(WRAP);
+            // The candidate closest to the previous timestamp.
+            [base - WRAP, base, base + WRAP].into_iter().map(|b| b + raw).min_by_key(|p| (p - prev).abs()).unwrap_or(raw)
+        }
+        None => raw,
+    };
+    *last = Some(pts);
+    pts
+}
+
+/// Split an Opus-in-MPEG-TS PES payload into Opus packets. Each packet comes
+/// after a control header: 0x7FE0 with flags, the size as a run of 0xFF bytes
+/// plus a final byte, then optional trim and extension fields.
+fn opus_packets(mut data: &[u8]) -> Vec<&[u8]> {
+    let mut packets = Vec::new();
+    while data.len() >= 2 && data[0] == 0x7F && data[1] & 0xE0 == 0xE0 {
+        let flags = data[1];
+        let mut at = 2;
+        let mut size = 0usize;
+        loop {
+            let Some(&b) = data.get(at) else { return packets };
+            at += 1;
+            size += usize::from(b);
+            if b != 0xFF {
+                break;
             }
-            None => raw,
-        };
-        self.last_pts = Some(pts);
-        pts
+        }
+        if flags & 0x10 != 0 {
+            at += 2; // start trim
+        }
+        if flags & 0x08 != 0 {
+            at += 2; // end trim
+        }
+        if flags & 0x04 != 0 {
+            at += 1 + usize::from(*data.get(at).unwrap_or(&0)); // control extension
+        }
+        let Some(packet) = data.get(at..at + size) else { return packets };
+        packets.push(packet);
+        data = &data[at + size..];
     }
+    packets
+}
+
+/// Samples (at 48 kHz) in an Opus packet, from its TOC byte (RFC 6716 3.1).
+pub fn opus_samples(packet: &[u8]) -> Option<u32> {
+    let toc = *packet.first()?;
+    let config = toc >> 3;
+    let per_frame = match config {
+        0..=11 => [480, 960, 1920, 2880][usize::from(config % 4)], // SILK: 10/20/40/60 ms
+        12..=15 => [480, 960][usize::from(config % 2)],             // hybrid: 10/20 ms
+        _ => [120, 240, 480, 960][usize::from(config % 4)],         // CELT: 2.5/5/10/20 ms
+    };
+    let frames = match toc & 0x3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => u32::from(*packet.get(1)? & 0x3F),
+    };
+    Some(per_frame * frames)
 }
 
 /// A 33-bit PES timestamp from its 5-byte encoding.
@@ -148,7 +244,11 @@ mod tests {
 
     /// TS packets carrying one PES with `data`, padded with an adaptation field.
     fn pes_packets(pid: u16, pts: i64, data: &[u8]) -> Vec<u8> {
-        let mut pes = vec![0, 0, 1, 0xE0, 0, 0, 0x80, 0x80, 5];
+        pes_packets_with(0xE0, pid, pts, data)
+    }
+
+    fn pes_packets_with(stream_id: u8, pid: u16, pts: i64, data: &[u8]) -> Vec<u8> {
+        let mut pes = vec![0, 0, 1, stream_id, 0, 0, 0x80, 0x80, 5];
         pes.extend_from_slice(&encode_timestamp(pts));
         pes.extend_from_slice(data);
         let mut out = Vec::new();
@@ -182,8 +282,8 @@ mod tests {
         }
         assert_eq!(out.len(), 2, "the last frame waits for the next one or finish");
         demux.finish(&mut out);
-        assert_eq!(out[0], TsFrame { pts: 3000, data: b"\0\0\0\x01\x65first".to_vec() });
-        assert_eq!(out[1], TsFrame { pts: 6000, data: big });
+        assert_eq!(out[0], TsFrame { kind: Kind::Video, pts: 3000, data: b"\0\0\0\x01\x65first".to_vec() });
+        assert_eq!(out[1], TsFrame { kind: Kind::Video, pts: 6000, data: big });
         assert_eq!(out[2].pts, 9000);
     }
 
@@ -198,5 +298,41 @@ mod tests {
         demux.push(&stream, &mut out);
         demux.finish(&mut out);
         assert_eq!(out.iter().map(|f| f.pts).collect::<Vec<_>>(), [wrap - 3000, wrap]);
+    }
+
+    #[test]
+    fn reads_opus_packets_interleaved_with_video() {
+        // Two Opus packets (20 ms CELT, TOC 0xFC... config 31 = 20 ms) in one
+        // PES: the first with a start trim, the second 300 bytes (size 255+45).
+        let first = [0xFC, 1, 2, 3];
+        let second: Vec<u8> = std::iter::once(0xFC).chain((0..299).map(|i| i as u8)).collect();
+        let mut pes = vec![0x7F, 0xF0, first.len() as u8, 0x01, 0x38];
+        pes.extend_from_slice(&first);
+        pes.extend_from_slice(&[0x7F, 0xE0, 0xFF, 45]);
+        pes.extend_from_slice(&second);
+
+        let mut stream = pes_packets_with(0xBD, 257, 1000, &pes);
+        stream.extend(pes_packets(256, 1500, b"\0\0\0\x01\x65v"));
+        stream.extend(pes_packets_with(0xBD, 257, 1000 + 2 * 1800, &[0x7F, 0xE0, 1, 0xFC]));
+        let mut demux = TsDemuxer::new();
+        let mut out = Vec::new();
+        demux.push(&stream, &mut out);
+        demux.finish(&mut out);
+
+        let audio: Vec<_> = out.iter().filter(|f| f.kind == Kind::Audio).collect();
+        assert_eq!(audio.len(), 3);
+        assert_eq!((audio[0].pts, audio[0].data.as_slice()), (1000, &first[..]));
+        assert_eq!((audio[1].pts, audio[1].data.len()), (1000 + 1800, 300), "20 ms later, size read past 0xFF");
+        assert_eq!(audio[2].pts, 1000 + 3600);
+        assert_eq!(out.iter().filter(|f| f.kind == Kind::Video).count(), 1);
+    }
+
+    #[test]
+    fn opus_durations_from_the_toc() {
+        assert_eq!(opus_samples(&[0xFC]), Some(960), "CELT FB 20 ms, one frame");
+        assert_eq!(opus_samples(&[0x18]), Some(2880), "SILK 60 ms (config 3)");
+        assert_eq!(opus_samples(&[0xFD]), Some(1920), "two 20 ms frames");
+        assert_eq!(opus_samples(&[0xE3, 3]), Some(360), "CELT 2.5 ms (config 28), code 3 with three frames");
+        assert_eq!(opus_samples(&[]), None);
     }
 }

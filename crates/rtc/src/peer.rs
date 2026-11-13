@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rtc::interceptor::Registry;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEngine};
+use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
 use rtc::peer_connection::transport::RTCIceServer;
 use rtc::rtp_transceiver::PayloadType;
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
@@ -24,8 +24,9 @@ pub use webrtc::peer_connection::RTCPeerConnectionState as ConnectionState;
 /// (fine on a LAN or the same machine).
 pub const DEFAULT_STUN_SERVER: &str = "stun:stun.l.google.com:19302";
 
-/// We only offer one codec, so both sides agree on a fixed payload type.
+/// We only offer one codec per kind, so both sides agree on fixed payload types.
 pub const H264_PAYLOAD_TYPE: PayloadType = 102;
+pub const OPUS_PAYLOAD_TYPE: PayloadType = 111;
 
 /// How long to wait for ICE gathering before sending whatever candidates we
 /// have. Host candidates are instant; this bounds the wait on slow STUN.
@@ -39,6 +40,17 @@ pub fn h264_codec() -> RTCRtpCodec {
         clock_rate: 90_000,
         channels: 0,
         sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_owned(),
+        rtcp_feedback: vec![],
+    }
+}
+
+/// Opus, 48 kHz stereo (the RTP clock is always 48 kHz for Opus).
+pub fn opus_codec() -> RTCRtpCodec {
+    RTCRtpCodec {
+        mime_type: MIME_TYPE_OPUS.to_owned(),
+        clock_rate: 48_000,
+        channels: 2,
+        sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1".to_owned(),
         rtcp_feedback: vec![],
     }
 }
@@ -69,8 +81,8 @@ impl PeerConnectionEventHandler for Forwarder {
     }
 }
 
-/// Create a peer connection that can send or receive H.264 video. Must be
-/// called inside a Tokio runtime.
+/// Create a peer connection that can send or receive H.264 video and Opus
+/// audio. Must be called inside a Tokio runtime.
 pub async fn new_peer_connection(
     ice_servers: &[String],
 ) -> Result<(impl PeerConnection, mpsc::UnboundedReceiver<PeerEvent>)> {
@@ -78,6 +90,10 @@ pub async fn new_peer_connection(
     media_engine.register_codec(
         RTCRtpCodecParameters { rtp_codec: h264_codec(), payload_type: H264_PAYLOAD_TYPE },
         RtpCodecKind::Video,
+    )?;
+    media_engine.register_codec(
+        RTCRtpCodecParameters { rtp_codec: opus_codec(), payload_type: OPUS_PAYLOAD_TYPE },
+        RtpCodecKind::Audio,
     )?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 

@@ -7,13 +7,14 @@
 //! changes and encoder delay are all handled by the same rule. Seeks restart
 //! ffmpeg at the new position.
 
-use crate::mpegts::{TsDemuxer, TsFrame};
+use crate::mpegts::{Kind, TsDemuxer, TsFrame, opus_samples};
 use mpvlink_rtc::h264::is_keyframe;
 use mpvlink_rtc::publish::Frame;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::collections::VecDeque;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -26,8 +27,10 @@ pub type Clock = Arc<dyn Fn() -> Option<f64> + Send + Sync>;
 /// ffmpeg lacks, or that fail to start (no such GPU), are skipped.
 const ENCODERS: &[&str] = &["h264_videotoolbox", "h264_nvenc", "h264_qsv", "libx264", "libopenh264"];
 
-/// Encoded frames ffmpeg can get ahead of playback by.
+/// Encoded frames ffmpeg can get ahead of playback by: in the pipe to us,
+/// and waiting here to be sent (video and audio together).
 const LOOKAHEAD_FRAMES: usize = 48;
+const MAX_PENDING: usize = 96;
 /// A frame due this far after mpv's position means playback jumped back
 /// (start over there); this far before it, ffmpeg is behind (skip ahead to
 /// the next keyframe rather than sending a backlog).
@@ -36,11 +39,31 @@ const MAX_DRIFT: f64 = 1.5;
 const SEEK_TOLERANCE: f64 = 0.15;
 /// How often to look at the clock while waiting.
 const POLL: Duration = Duration::from_millis(10);
+/// Audio goes out this much ahead of its place in playback: about what the
+/// viewer buffers before playing it (video is shown as soon as it arrives),
+/// so the two come out together.
+const AUDIO_LEAD: f64 = 0.1;
+/// Audio this late is dropped: sending it would only add delay on the other side.
+const AUDIO_MAX_LATE: f64 = 0.25;
+
+/// Which audio to stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioChoice {
+    /// None (audio is turned off in mpv).
+    Off,
+    /// This stream of the file (ffmpeg's index).
+    Stream(i64),
+    /// The file's first audio stream, if it has one.
+    First,
+}
 
 pub struct StreamSource {
     /// Absolute file path, or an http(s) URL.
     pub path: String,
     pub title: String,
+    /// The file's video stream to send (ffmpeg's index), else the first.
+    pub video_stream: Option<i64>,
+    pub audio: AudioChoice,
     /// The ffmpeg executable.
     pub ffmpeg: String,
     pub kbps: u32,
@@ -92,6 +115,17 @@ impl Drop for Pipeline {
     }
 }
 
+/// A frame waiting until it's due.
+struct Pending {
+    data: Vec<u8>,
+    audio: bool,
+    keyframe: bool,
+    /// Its position in the file, and when (on mpv's clock) to send it.
+    file_time: f64,
+    at: f64,
+    duration: Duration,
+}
+
 /// Why one ffmpeg run ended.
 enum Ended {
     Stopped,
@@ -112,9 +146,13 @@ struct Runner {
 impl Runner {
     fn run(mut self) {
         let encoders = match find_ffmpeg(&self.source.ffmpeg) {
-            Ok((path, list)) if !list.is_empty() => {
+            Ok((path, found)) if !found.video.is_empty() => {
                 self.source.ffmpeg = path;
-                list
+                if !found.opus {
+                    self.source.audio = AudioChoice::Off;
+                    eprintln!("[mpvlink] this ffmpeg has no libopus: streaming video only");
+                }
+                found.video
             }
             Ok(_) => return self.fail("This ffmpeg has no H.264 encoder.".into()),
             Err(e) => {
@@ -222,87 +260,132 @@ impl Runner {
         let mut seeks = self.source.seeks.load(Ordering::SeqCst);
         // Timestamp of the first frame, which is at `start` in the file.
         let mut base: Option<i64> = None;
-        let mut previous: Option<i64> = None;
-        let mut position = start; // file position of the last frame handled
+        let mut previous_video: Option<i64> = None;
+        let mut position = start; // file position of the last frame sent
         let mut finished = false;
-        // Behind schedule: dropping frames until a keyframe to resume from.
+        // Behind schedule: dropping video until a keyframe to resume from.
         let mut skipping = false;
+        // Frames read from ffmpeg, per kind. ffmpeg's output has audio ahead
+        // of video (the video encoder holds frames back), so each kind waits
+        // in its own queue and whichever is due first goes first.
+        let mut queues: [VecDeque<Pending>; 2] = Default::default();
 
         loop {
             if self.stopped() {
                 return Ended::Stopped;
             }
-            let frame = if finished {
-                std::thread::sleep(POLL * 5);
-                None
-            } else {
-                match rx.recv_timeout(POLL) {
-                    Ok(frame) => Some(frame),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) if base.is_none() => return Ended::NoOutput(String::new()),
-                    Err(RecvTimeoutError::Disconnected) => {
-                        finished = true; // end of the file; wait in case of a seek back
-                        None
-                    }
+            // Take what ffmpeg has produced, up to a limit (beyond it, ffmpeg
+            // waits: that's what keeps it from running far ahead).
+            let room = |queues: &[VecDeque<Pending>; 2]| queues.iter().map(VecDeque::len).sum::<usize>() < MAX_PENDING;
+            while !finished && room(&queues) {
+                match rx.try_recv() {
+                    Ok(frame) => self.queue_frame(frame, start, &mut base, &mut previous_video, &mut queues, encoder, announced),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => finished = true,
                 }
+            }
+            let next = queues
+                .iter()
+                .enumerate()
+                .filter_map(|(i, q)| q.front().map(|f| (i, f.at)))
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i);
+            let Some(now) = clock() else {
+                std::thread::sleep(POLL);
+                continue;
             };
-            let Some(frame) = frame else {
+
+            let Some(kind) = next else {
+                if finished && base.is_none() {
+                    return Ended::NoOutput(String::new());
+                }
                 // Waiting on ffmpeg (or at the end): still follow seeks.
                 if let Some(restart) = self.check_seek(&mut seeks, position) {
                     return restart;
                 }
+                if finished {
+                    std::thread::sleep(POLL * 5);
+                } else if let Ok(frame) = rx.recv_timeout(POLL) {
+                    self.queue_frame(frame, start, &mut base, &mut previous_video, &mut queues, encoder, announced);
+                }
                 continue;
             };
+            let frame = queues[kind].front().expect("picked a non-empty queue");
 
-            if !*announced {
-                *announced = true;
-                let _ = self.events.send(PipelineEvent::Started { encoder: encoder.to_string() });
+            let seeked = self.source.seeks.load(Ordering::SeqCst);
+            if seeked != seeks {
+                seeks = seeked;
+                if (frame.file_time - now).abs() > SEEK_TOLERANCE {
+                    return Ended::Restart(now);
+                }
             }
-            let base = *base.get_or_insert(frame.pts);
-            let at = start + (frame.pts - base) as f64 / 90_000.0;
-            let duration = previous
-                .map(|p| Duration::from_secs_f64(((frame.pts - p) as f64 / 90_000.0).clamp(0.001, 1.0)))
-                .unwrap_or(Duration::from_millis(33));
-            previous = Some(frame.pts);
-            position = at;
-            let keyframe = is_keyframe(&frame.data);
-
-            // Hold the frame until mpv's playback gets to it.
-            loop {
-                if self.stopped() {
-                    return Ended::Stopped;
-                }
-                let Some(now) = clock() else {
-                    std::thread::sleep(POLL);
-                    continue;
-                };
-                let seeked = self.source.seeks.load(Ordering::SeqCst);
-                if seeked != seeks {
-                    seeks = seeked;
-                    if (at - now).abs() > SEEK_TOLERANCE {
-                        return Ended::Restart(now);
-                    }
-                }
-                if at - now > MAX_DRIFT {
-                    return Ended::Restart(now); // playback went back
-                }
-                // Behind: drop frames until a keyframe to resume from (frames
-                // in between can't be decoded without the ones dropped).
-                if keyframe {
+            if frame.file_time - now > MAX_DRIFT {
+                return Ended::Restart(now); // playback went back
+            }
+            // Video behind: drop frames until a keyframe to resume from
+            // (frames in between can't be decoded without the ones dropped).
+            if !frame.audio {
+                if frame.keyframe {
                     skipping = false;
-                } else if now - at > MAX_DRIFT {
+                } else if now - frame.at > MAX_DRIFT {
                     skipping = true;
                 }
-                if skipping || at <= now + 0.004 {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs_f64(at - now).min(POLL * 2));
             }
-            if skipping {
+            let due = frame.at <= now + 0.004 || (!frame.audio && skipping);
+            if !due {
+                // Wait for it, but keep reading: a frame of the other kind
+                // that's due sooner may arrive meanwhile.
+                let wait = Duration::from_secs_f64(frame.at - now).min(POLL * 2);
+                if !finished && room(&queues) {
+                    if let Ok(frame) = rx.recv_timeout(wait) {
+                        self.queue_frame(frame, start, &mut base, &mut previous_video, &mut queues, encoder, announced);
+                    }
+                } else {
+                    std::thread::sleep(wait);
+                }
                 continue;
             }
-            let _ = self.frames.send(Frame::new(&frame.data, keyframe, duration));
+            let frame = queues[kind].pop_front().expect("non-empty");
+            position = frame.file_time;
+            if frame.audio {
+                if now - frame.at <= AUDIO_MAX_LATE {
+                    let _ = self.frames.send(Frame::audio(&frame.data, frame.duration));
+                }
+            } else if !skipping {
+                let _ = self.frames.send(Frame::new(&frame.data, frame.keyframe, frame.duration));
+            }
         }
+    }
+
+    /// Work out when a frame from ffmpeg is due and queue it by kind.
+    #[allow(clippy::too_many_arguments)]
+    fn queue_frame(
+        &self,
+        frame: TsFrame,
+        start: f64,
+        base: &mut Option<i64>,
+        previous_video: &mut Option<i64>,
+        queues: &mut [VecDeque<Pending>; 2],
+        encoder: &str,
+        announced: &mut bool,
+    ) {
+        if !*announced {
+            *announced = true;
+            let _ = self.events.send(PipelineEvent::Started { encoder: encoder.to_string() });
+        }
+        let base = *base.get_or_insert(frame.pts);
+        let file_time = start + (frame.pts - base) as f64 / 90_000.0;
+        let audio = frame.kind == Kind::Audio;
+        let (at, duration) = if audio {
+            let samples = opus_samples(&frame.data).unwrap_or(960);
+            (file_time - AUDIO_LEAD, Duration::from_secs_f64(f64::from(samples) / 48_000.0))
+        } else {
+            let d = previous_video.map(|p| ((frame.pts - p) as f64 / 90_000.0).clamp(0.001, 1.0)).unwrap_or(0.033);
+            *previous_video = Some(frame.pts);
+            (file_time, Duration::from_secs_f64(d))
+        };
+        let keyframe = !audio && is_keyframe(&frame.data);
+        queues[usize::from(audio)].push_back(Pending { data: frame.data, audio, keyframe, file_time, at, duration });
     }
 
     /// While no frame is due: restart if mpv seeked away from `position`, or
@@ -346,7 +429,20 @@ fn ffmpeg_command(source: &StreamSource, start: f64, encoder: &str) -> Command {
         // Before -i: a fast seek that still starts exactly at `start`.
         c.args(["-ss", &format!("{start:.3}")]);
     }
-    c.args(["-i", &source.path, "-map", "0:v:0", "-an", "-sn", "-dn"]);
+    let video = source.video_stream.map_or_else(|| "0:v:0".to_string(), |i| format!("0:{i}"));
+    c.args(["-i", &source.path, "-map", &video]);
+    let audio = match source.audio {
+        AudioChoice::Off => None,
+        AudioChoice::Stream(i) => Some(format!("0:{i}")),
+        AudioChoice::First => Some("0:a:0?".to_string()), // "?": fine if there's none
+    };
+    match audio {
+        // Opus, 48 kHz stereo, 20 ms packets (what WebRTC expects).
+        Some(map) => c.args(["-map", &map, "-c:a", "libopus", "-b:a", "128k", "-ac", "2", "-ar", "48000"])
+            .args(["-frame_duration", "20", "-application", "audio"]),
+        None => c.arg("-an"),
+    };
+    c.args(["-sn", "-dn"]);
     // At most 1080p, 8-bit 4:2:0 (what every H.264 decoder handles).
     c.args([
         "-vf",
@@ -366,17 +462,41 @@ fn ffmpeg_command(source: &StreamSource, start: f64, encoder: &str) -> Command {
     // viewers can start, and where a viewer recovers after packet loss), and
     // only those.
     c.args(["-bf", "0", "-g", "600", "-force_key_frames", "expr:gte(t,n_forced*1)"]);
-    c.args(["-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", "pipe:1"]);
+    // One PES per audio packet, so audio arrives evenly rather than in bursts.
+    c.args(["-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", "-pes_payload_size", "0", "pipe:1"]);
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     hide_console_window(&mut c);
     c
+}
+
+/// The ffmpeg that streaming would use for the `configured` setting, or a
+/// short explanation of why there isn't a usable one. Runs ffmpeg once.
+pub fn locate(configured: &str) -> Result<String, String> {
+    match find_ffmpeg(configured) {
+        Ok((path, found)) if !found.video.is_empty() => Ok(on_path(&path).unwrap_or(path)),
+        Ok((path, _)) => Err(format!("{path} has no H.264 encoder.")),
+        Err(_) if configured == "ffmpeg" => Err("No ffmpeg found.".into()),
+        Err(e) => Err(format!("Couldn't run it ({e}).")),
+    }
+}
+
+/// Where a bare program name like "ffmpeg" is found on PATH (to show it).
+fn on_path(name: &str) -> Option<String> {
+    if name.contains(['/', '\\']) {
+        return None;
+    }
+    let exe = if cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe") { format!("{name}.exe") } else { name.to_string() };
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(&exe))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Find a working ffmpeg: `configured`, or when that's the plain default
 /// "ffmpeg", also the usual install locations (mpv started from the macOS
 /// Dock or Finder doesn't get Homebrew's directory on its PATH). Returns its
 /// path and H.264 encoders.
-fn find_ffmpeg(configured: &str) -> std::io::Result<(String, Vec<&'static str>)> {
+fn find_ffmpeg(configured: &str) -> std::io::Result<(String, Encoders)> {
     let fallbacks: &[&str] = if configured == "ffmpeg" { &["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] } else { &[] };
     let mut first_error = None;
     for path in std::iter::once(configured).chain(fallbacks.iter().copied()) {
@@ -390,14 +510,21 @@ fn find_ffmpeg(configured: &str) -> std::io::Result<(String, Vec<&'static str>)>
     Err(first_error.expect("tried at least one"))
 }
 
-/// The H.264 encoders from [`ENCODERS`] this ffmpeg has, best first.
-fn available_encoders(ffmpeg: &str) -> std::io::Result<Vec<&'static str>> {
+struct Encoders {
+    /// H.264 encoders from [`ENCODERS`], best first.
+    video: Vec<&'static str>,
+    /// libopus, for audio.
+    opus: bool,
+}
+
+/// The encoders this ffmpeg has.
+fn available_encoders(ffmpeg: &str) -> std::io::Result<Encoders> {
     let mut c = Command::new(ffmpeg);
     c.args(["-hide_banner", "-encoders"]).stdin(Stdio::null()).stderr(Stdio::null());
     hide_console_window(&mut c);
     let listing = String::from_utf8_lossy(&c.output()?.stdout).into_owned();
     let has = |name: &str| listing.split_whitespace().any(|word| word == name);
-    Ok(ENCODERS.iter().copied().filter(|e| has(e)).collect())
+    Ok(Encoders { video: ENCODERS.iter().copied().filter(|e| has(e)).collect(), opus: has("libopus") })
 }
 
 /// ffmpeg is a console program; on Windows, don't flash a console window.

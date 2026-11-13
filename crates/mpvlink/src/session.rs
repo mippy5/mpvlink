@@ -10,7 +10,7 @@
 //! ourselves. While we're streaming it points at ourselves.
 
 use crate::ffmpeg::{Pipeline, PipelineEvent, StreamSource};
-use crate::stream::{self, FrameQueue};
+use crate::stream::{self, AudioQueue, FrameQueue};
 use anyhow::{Context, Result, bail};
 use mpvlink_rtc::h264::{FrameAssembler, is_keyframe};
 use mpvlink_rtc::peer::{self, ConnectionState, PeerEvent, new_peer_connection};
@@ -43,8 +43,11 @@ pub struct SessionConfig {
 pub enum SessionEvent {
     /// Something to tell the user.
     Status(String),
-    /// Video from `peer` arrived: play `mpvlink://ROOM/PEER`.
-    WatchStarted { peer: PeerId, name: String },
+    /// Video from `peer` arrived: play `mpvlink://ROOM/PEER`, plus its audio
+    /// track if `audio`.
+    WatchStarted { peer: PeerId, name: String, audio: bool },
+    /// Audio from `peer` started after its video did: add the audio track.
+    AudioStarted { peer: PeerId },
     /// The stream we were watching ended.
     StreamEnded(String),
     /// The session is over (e.g. rejected by the server).
@@ -154,6 +157,7 @@ pub struct Session {
     /// reported, so a late "disconnected" can't reach a newer session.
     closing: Arc<AtomicBool>,
     queue: Arc<FrameQueue>,
+    audio: Arc<AudioQueue>,
     runtime: Option<tokio::runtime::Runtime>,
 }
 
@@ -165,7 +169,8 @@ impl Session {
             .enable_all()
             .build()?;
         let queue = FrameQueue::new();
-        stream::publish(&config.room, queue.clone());
+        let audio = AudioQueue::new();
+        stream::publish(&config.room, queue.clone(), audio.clone());
 
         let room = config.room.clone();
         let state = Arc::new(Mutex::new(RoomState::default()));
@@ -180,13 +185,14 @@ impl Session {
             })
         };
         let (commands, command_rx) = mpsc::unbounded_channel();
-        let (q, st, sig) = (queue.clone(), state.clone(), signaling.clone());
+        let media = Media { video: queue.clone(), audio: audio.clone() };
+        let (st, sig) = (state.clone(), signaling.clone());
         runtime.spawn(async move {
-            if let Err(e) = run(config, q, st, sig, command_rx, notify.clone()).await {
+            if let Err(e) = run(config, media, st, sig, command_rx, notify.clone()).await {
                 notify(SessionEvent::Failed(format!("{e:#}")));
             }
         });
-        Ok(Self { room, state, commands, signaling, closing, queue, runtime: Some(runtime) })
+        Ok(Self { room, state, commands, signaling, closing, queue, audio, runtime: Some(runtime) })
     }
 
     pub fn room(&self) -> &str {
@@ -224,6 +230,7 @@ impl Drop for Session {
         self.closing.store(true, Ordering::SeqCst);
         stream::unpublish(&self.room);
         self.queue.end();
+        self.audio.end();
         let Some(rt) = self.runtime.take() else { return };
         // Tell the server we're leaving, so others see it right away rather
         // than after its reconnect window. Takes at most a second.
@@ -238,9 +245,30 @@ impl Drop for Session {
     }
 }
 
+/// Where received video and audio go (mpv reads them via `stream`).
+#[derive(Clone)]
+struct Media {
+    video: Arc<FrameQueue>,
+    audio: Arc<AudioQueue>,
+}
+
+impl Media {
+    /// A new stream is coming: drop what's queued (mpv freezes on the last frame).
+    fn reset(&self) {
+        self.video.reset();
+        self.audio.reset();
+    }
+
+    /// No stream any more: mpv reaches the end.
+    fn end(&self) {
+        self.video.end();
+        self.audio.end();
+    }
+}
+
 async fn run(
     config: SessionConfig,
-    queue: Arc<FrameQueue>,
+    media: Media,
     state: Arc<Mutex<RoomState>>,
     signaling_slot: Arc<Mutex<Option<Signaling>>>,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -253,7 +281,7 @@ async fn run(
     let (pipeline_events, mut pipeline_rx) = mpsc::unbounded_channel();
     let mut room = Room {
         config,
-        queue,
+        media,
         state,
         notify,
         signaling,
@@ -287,7 +315,7 @@ async fn run(
 
 struct Room {
     config: SessionConfig,
-    queue: Arc<FrameQueue>,
+    media: Media,
     state: Arc<Mutex<RoomState>>,
     notify: Notify,
     signaling: Signaling,
@@ -378,7 +406,7 @@ impl Room {
                 p.clear();
             }
             self.stop_watching();
-            self.queue.reset();
+            self.media.reset();
         }
         let streaming = self.pipeline.is_some();
         let name = self.config.name.clone();
@@ -456,17 +484,19 @@ impl Room {
                     return;
                 }
                 let title = source.title.clone();
-                self.pipeline = None; // stop any previous file first
+                let restart = self.pipeline.take().is_some(); // stop any previous one first
                 let publisher = self.publisher.get_or_insert_with(|| {
                     let log = Arc::new(|line: String| eprintln!("[mpvlink] {line}"));
-                    Publisher::new(self.signaling.clone(), self.config.ice_servers.clone(), log)
+                    Publisher::new(self.signaling.clone(), self.config.ice_servers.clone(), true, log)
                 });
                 let frames = publisher.frames();
                 self.pipeline = Some(Pipeline::start(source, frames, self.pipeline_events.clone()));
                 self.signaling.set_streaming(true);
                 self.chosen = true;
                 self.update(|s| s.set_my_streaming(true));
-                self.status(format!("Streaming {title} to room {}.", self.config.room));
+                if !restart {
+                    self.status(format!("Streaming {title} to room {}.", self.config.room));
+                }
             }
             Command::StopStreaming => self.stop_streaming(None),
             Command::Subtitle(text) => {
@@ -538,7 +568,7 @@ impl Room {
         match want {
             Some(id) => {
                 // Freeze on the last frame until the new stream starts.
-                self.queue.reset();
+                self.media.reset();
                 self.signaling.signal(id, Signal::Watch);
                 self.watching = Some(id);
                 if self.joined {
@@ -546,7 +576,7 @@ impl Room {
                 }
             }
             // Nothing to watch: end the stream so mpv stops showing it.
-            None => self.queue.end(),
+            None => self.media.end(),
         }
     }
 
@@ -564,12 +594,12 @@ impl Room {
         if let Some(task) = self.receiver.take() {
             task.abort();
         }
-        self.queue.reset();
+        self.media.reset();
         let ctx = Receiver {
             publisher: from,
             name: self.name_of(from),
             signaling: self.signaling.clone(),
-            queue: self.queue.clone(),
+            media: self.media.clone(),
             notify: self.notify.clone(),
             ice_servers: self.config.ice_servers.clone(),
         };
@@ -587,7 +617,7 @@ struct Receiver {
     publisher: PeerId,
     name: String,
     signaling: Signaling,
-    queue: Arc<FrameQueue>,
+    media: Media,
     notify: Notify,
     ice_servers: Vec<String>,
 }
@@ -595,11 +625,12 @@ struct Receiver {
 impl Receiver {
     async fn run(self, offer: String) -> Result<()> {
         let (pc, mut events) = new_peer_connection(&self.ice_servers).await?;
-        pc.add_transceiver_from_kind(
-            RtpCodecKind::Video,
-            Some(RTCRtpTransceiverInit { direction: RTCRtpTransceiverDirection::Recvonly, ..Default::default() }),
-        )
-        .await?;
+        let recvonly = || RTCRtpTransceiverInit { direction: RTCRtpTransceiverDirection::Recvonly, ..Default::default() };
+        pc.add_transceiver_from_kind(RtpCodecKind::Video, Some(recvonly())).await?;
+        // Streams from mpv carry audio; the test sender's don't.
+        if offer.contains("m=audio") {
+            pc.add_transceiver_from_kind(RtpCodecKind::Audio, Some(recvonly())).await?;
+        }
         pc.set_remote_description(RTCSessionDescription::offer(offer)?).await?;
         let answer = pc.create_answer(None).await?;
         pc.set_local_description(answer).await?;
@@ -608,7 +639,8 @@ impl Receiver {
         let local = pc.local_description().await.context("no local description")?;
         self.signaling.signal(self.publisher, Signal::Answer { sdp: local.sdp });
 
-        let mut reader: Option<JoinHandle<()>> = None;
+        let mut readers: Vec<JoinHandle<()>> = Vec::new();
+        let started = Arc::new(Started::default());
         let result = loop {
             let event = match deferred.pop() {
                 Some(e) => e,
@@ -625,21 +657,30 @@ impl Receiver {
                     break Err(anyhow::anyhow!("connection {s}"));
                 }
                 PeerEvent::Track(track) => {
-                    let task = tokio::spawn(read_track(
-                        track,
-                        (self.publisher, self.name.clone()),
-                        self.signaling.clone(),
-                        self.queue.clone(),
-                        self.notify.clone(),
-                    ));
-                    if let Some(old) = reader.replace(task) {
-                        old.abort();
-                    }
+                    let task = if track.kind().await == RtpCodecKind::Audio {
+                        tokio::spawn(read_audio(
+                            track,
+                            self.publisher,
+                            self.media.audio.clone(),
+                            started.clone(),
+                            self.notify.clone(),
+                        ))
+                    } else {
+                        tokio::spawn(read_video(
+                            track,
+                            (self.publisher, self.name.clone()),
+                            self.signaling.clone(),
+                            self.media.clone(),
+                            started.clone(),
+                            self.notify.clone(),
+                        ))
+                    };
+                    readers.push(task);
                 }
                 _ => {}
             }
         };
-        if let Some(task) = reader {
+        for task in readers {
             task.abort();
         }
         let _ = pc.close().await;
@@ -647,17 +688,25 @@ impl Receiver {
     }
 }
 
+/// What the plugin has been told about one connection's media, shared by
+/// its video and audio readers.
+#[derive(Default)]
+struct Started {
+    video: AtomicBool,
+    audio: AtomicBool,
+}
+
 /// Reassemble RTP into frames and queue them for mpv.
-async fn read_track(
+async fn read_video(
     track: Arc<dyn TrackRemote>,
     (publisher, name): (PeerId, String),
     signaling: Signaling,
-    queue: Arc<FrameQueue>,
+    media: Media,
+    started: Arc<Started>,
     notify: Notify,
 ) {
     let mut assembler = FrameAssembler::new();
     let mut last_request: Option<Instant> = None;
-    let mut started = false;
 
     while let Some(event) = track.poll().await {
         let TrackRemoteEvent::OnRtpPacket(packet) = event else { continue };
@@ -665,15 +714,39 @@ async fn read_track(
         let mut want_keyframe = pushed.lost || assembler.waiting_for_keyframe();
         if let Some(frame) = pushed.frame {
             let keyframe = is_keyframe(&frame);
-            want_keyframe |= queue.push(frame, keyframe);
-            if keyframe && !started {
-                started = true;
-                notify(SessionEvent::WatchStarted { peer: publisher, name: name.clone() });
+            want_keyframe |= media.video.push(frame, keyframe);
+            if keyframe && !started.video.swap(true, Ordering::SeqCst) {
+                // Audio arrives continuously, so by the first keyframe it's
+                // flowing if the stream has any.
+                let audio = media.audio.active() && !started.audio.swap(true, Ordering::SeqCst);
+                notify(SessionEvent::WatchStarted { peer: publisher, name: name.clone(), audio });
             }
         }
         if want_keyframe && last_request.is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_INTERVAL) {
             signaling.signal(publisher, Signal::KeyframeRequest);
             last_request = Some(Instant::now());
+        }
+    }
+}
+
+/// Opus packets go to mpv as they come (one per RTP packet).
+async fn read_audio(
+    track: Arc<dyn TrackRemote>,
+    publisher: PeerId,
+    audio: Arc<AudioQueue>,
+    started: Arc<Started>,
+    notify: Notify,
+) {
+    while let Some(event) = track.poll().await {
+        let TrackRemoteEvent::OnRtpPacket(packet) = event else { continue };
+        if packet.payload.is_empty() {
+            continue;
+        }
+        audio.push(packet.payload);
+        // Sound that starts after the picture (e.g. the streamer switched to
+        // a file with audio): mpv needs to add the track.
+        if started.video.load(Ordering::SeqCst) && !started.audio.swap(true, Ordering::SeqCst) {
+            notify(SessionEvent::AudioStarted { peer: publisher });
         }
     }
 }

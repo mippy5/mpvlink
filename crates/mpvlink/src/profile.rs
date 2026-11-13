@@ -16,6 +16,8 @@ pub struct Profile {
     pub display_name: String,
     /// Signaling server URL; empty means the default.
     pub server: String,
+    /// ffmpeg executable for streaming; empty means find it automatically.
+    pub ffmpeg: String,
 }
 
 impl Profile {
@@ -47,6 +49,7 @@ impl Profile {
             match key.trim() {
                 "name" => profile.display_name = value,
                 "server" => profile.server = value,
+                "ffmpeg" => profile.ffmpeg = value,
                 _ => {}
             }
         }
@@ -58,7 +61,7 @@ impl Profile {
         // control characters anyway so one value can't inject extra keys.
         let clean = |v: &str| v.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string();
         let mut out = String::from("# mpvlink profile\n");
-        for (key, value) in [("name", &self.display_name), ("server", &self.server)] {
+        for (key, value) in [("name", &self.display_name), ("server", &self.server), ("ffmpeg", &self.ffmpeg)] {
             let value = clean(value);
             if !value.is_empty() {
                 out.push_str(&format!("{key}={value}\n"));
@@ -74,10 +77,15 @@ mod tests {
 
     #[test]
     fn round_trips_through_text() {
-        let p = Profile { display_name: "Zoë = the {cat}".into(), server: "wss://signal.example.com:8443/x?a=b".into() };
+        let p = Profile {
+            display_name: "Zoë = the {cat}".into(),
+            server: "wss://signal.example.com:8443/x?a=b".into(),
+            ffmpeg: r"C:\Program Files\ffmpeg\bin\ffmpeg.exe".into(),
+        };
         assert_eq!(Profile::parse(&p.serialize()), p);
-        let no_server = Profile { display_name: "Ana".into(), server: String::new() };
+        let no_server = Profile { display_name: "Ana".into(), ..Default::default() };
         assert!(!no_server.serialize().contains("server="), "default isn't written");
+        assert!(!no_server.serialize().contains("ffmpeg="));
         assert_eq!(Profile::parse(&no_server.serialize()), no_server);
     }
 
@@ -90,7 +98,7 @@ mod tests {
 
     #[test]
     fn serialize_strips_newlines() {
-        let p = Profile { display_name: "Ana\nname=Evil".into(), server: String::new() };
+        let p = Profile { display_name: "Ana\nname=Evil".into(), ..Default::default() };
         assert_eq!(Profile::parse(&p.serialize()).display_name, "Ananame=Evil");
     }
 
@@ -100,7 +108,7 @@ mod tests {
         let path = dir.join("nested/profile");
         assert_eq!(Profile::load(&path), Profile::default(), "missing file loads empty");
 
-        let p = Profile { display_name: "Dana".into(), server: "wss://x.example".into() };
+        let p = Profile { display_name: "Dana".into(), server: "wss://x.example".into(), ..Default::default() };
         p.save(&path).unwrap();
         assert_eq!(Profile::load(&path), p);
         assert!(!path.with_extension("tmp").exists());

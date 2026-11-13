@@ -12,7 +12,7 @@
 //! Options (`--script-opts=key=value,...`); these override saved settings:
 //!   mpvlink-server=wss://host       signaling server (default: saved setting, else ws://127.0.0.1:8787)
 //!   mpvlink-stun=stun:host:port     STUN server, or "no" for none (default: Google's public one)
-//!   mpvlink-ffmpeg=/path/to/ffmpeg  ffmpeg for streaming your own videos (default: from PATH)
+//!   mpvlink-ffmpeg=/path/to/ffmpeg  ffmpeg for streaming your own videos (default: saved setting, else PATH)
 //!   mpvlink-kbps=6000               bitrate of your stream
 //!
 //! In a room, the member list (top left) shows an arrow at whose stream you're
@@ -30,8 +30,9 @@ mod room;
 mod roster;
 mod session;
 mod stream;
+mod webm;
 
-use menu::{Action, Layout, Menu};
+use menu::{Action, Layout, Menu, SettingsContext, SettingsField, SettingsValues};
 use mpv::{Event, Mpv};
 use profile::Profile;
 use mpvlink_rtc::proto::PeerId;
@@ -49,6 +50,7 @@ const OBSERVE_OSD: u64 = 1;
 const OBSERVE_MOUSE: u64 = 2;
 const OBSERVE_SUB: u64 = 3;
 const OBSERVE_IDLE: u64 = 4;
+const OBSERVE_TRACKS: u64 = 5;
 
 const GLOBAL_SECTION: &str = "mpvlink-global";
 const MENU_SECTION: &str = "mpvlink-menu";
@@ -65,13 +67,19 @@ pub(crate) const DEFAULT_SERVER: &str = "ws://127.0.0.1:8787";
 
 /// Per-file options for playing a room's stream with as little delay as mpv
 /// allows: raw H.264 with no probing or buffering, frames shown as soon as
-/// they're decoded (no A/V sync to wait for; there's no audio yet).
+/// they're decoded. Audio (an extra track, live WebM) plays alongside on its
+/// own small buffer: video never waits for it, nor is it dropped to match it.
 const LOW_LATENCY_OPTIONS: &[&str] = &[
     "demuxer-lavf-format=h264",
     "demuxer-lavf-probesize=32",
     "demuxer-lavf-analyzeduration=0",
     "demuxer-lavf-probe-info=nostreams",
     "demuxer-lavf-o=fflags=+nobuffer",
+    // Raw H.264 has no timestamps, so the demuxer makes them up from a frame
+    // rate. A very high one (1 ms per frame) keeps video "behind" mpv's
+    // clock, so each frame is shown the moment it's decoded; at the default
+    // 25 fps, mpv would pace 30 fps video too slowly once there's audio.
+    "demuxer-lavf-o-append=framerate=1000",
     "cache=no",
     // Don't pause to "buffer" when the next frame hasn't arrived yet: it's live.
     "cache-pause=no",
@@ -79,6 +87,17 @@ const LOW_LATENCY_OPTIONS: &[&str] = &[
     "vd-lavc-threads=1",
     "video-latency-hacks=yes",
     "interpolation=no",
+    // The audio track is WebM, read by mpv's own Matroska demuxer (the lavf
+    // format above is only for the video).
+    "audio-demuxer=mkv",
+    "demuxer-readahead-secs=0",
+    // Play audio and video independently: by default mpv times video to the
+    // audio clock, which would hold the picture back by the audio buffer.
+    // (`untimed` alone isn't enough once there's audio.)
+    "video-sync=desync",
+    "initial-audio-sync=no",
+    "framedrop=no",
+    "audio-buffer=0.1",
 ];
 
 struct Plugin {
@@ -338,9 +357,14 @@ impl Plugin {
                 self.create_room(&name);
             }
             Action::OpenSettings => {
-                let overridden_by = self.script_opt("mpvlink-server");
+                let values = SettingsValues { server: self.profile.server.clone(), ffmpeg: self.profile.ffmpeg.clone() };
+                let context = SettingsContext {
+                    server_override: self.script_opt("mpvlink-server"),
+                    ffmpeg_override: self.script_opt("mpvlink-ffmpeg"),
+                    ffmpeg_found: ffmpeg::locate(&self.ffmpeg_setting()),
+                };
                 if let Some(menu) = self.menu.as_mut() {
-                    menu.open_settings(&self.profile.server, overridden_by.as_deref());
+                    menu.open_settings(&values, context);
                 }
                 self.redraw();
             }
@@ -350,31 +374,71 @@ impl Plugin {
                 }
                 self.redraw();
             }
-            Action::SaveSettings { server } => {
+            Action::SaveSettings { values } => {
+                // Check an ffmpeg path now, rather than when streaming fails.
+                if !values.ffmpeg.is_empty()
+                    && let Err(problem) = ffmpeg::locate(&self.expand_user_path(&values.ffmpeg))
+                {
+                    if let Some(menu) = self.menu.as_mut() {
+                        menu.reject_setting(SettingsField::Ffmpeg, problem);
+                    }
+                    self.redraw();
+                    return;
+                }
                 if let Some(menu) = self.menu.as_mut() {
                     menu.close_settings();
                 }
                 self.redraw();
-                self.save_server(server);
+                self.save_settings(values);
             }
         }
     }
 
-    /// Persist the signaling server setting ("" = default) and say where it applies.
-    fn save_server(&mut self, server: String) {
-        if server == self.profile.server {
+    /// Persist the settings ("" = default) and say what changed and where it applies.
+    fn save_settings(&mut self, values: SettingsValues) {
+        let mut notes = Vec::new();
+        if values.server != self.profile.server {
+            self.profile.server = values.server;
+            notes.push(format!("Signaling server: {}", self.settings().0));
+            if self.script_opt("mpvlink-server").is_some() {
+                notes.push("(--script-opts overrides the saved server)".into());
+            } else if let Some(session) = &self.session {
+                notes.push(format!("Applies the next time you join (still in room {}).", session.room()));
+            }
+        }
+        if values.ffmpeg != self.profile.ffmpeg {
+            self.profile.ffmpeg = values.ffmpeg;
+            match ffmpeg::locate(&self.ffmpeg_setting()) {
+                Ok(path) => notes.push(format!("Streaming uses {path}")),
+                Err(problem) => notes.push(format!("ffmpeg: {problem}")),
+            }
+            if self.script_opt("mpvlink-ffmpeg").is_some() {
+                notes.push("(--script-opts overrides the saved ffmpeg)".into());
+            }
+        }
+        if notes.is_empty() {
             return;
         }
-        self.profile.server = server;
         self.save_profile();
-        let effective = self.settings().0;
-        let mut msg = format!("Signaling server: {effective}");
-        if self.script_opt("mpvlink-server").is_some() {
-            msg.push_str("\n(--script-opts overrides the saved setting)");
-        } else if let Some(session) = &self.session {
-            msg.push_str(&format!("\nApplies the next time you join (still in room {}).", session.room()));
+        self.osd(&notes.join("\n"), 5000);
+    }
+
+    /// The ffmpeg to stream with: --script-opts, else the saved setting, else
+    /// "ffmpeg" (found on PATH or in the usual places).
+    fn ffmpeg_setting(&self) -> String {
+        self.script_opt("mpvlink-ffmpeg")
+            .or_else(|| (!self.profile.ffmpeg.is_empty()).then(|| self.profile.ffmpeg.clone()))
+            .map(|p| self.expand_user_path(&p))
+            .unwrap_or_else(|| "ffmpeg".into())
+    }
+
+    /// Expand a leading `~` (home directory) the way mpv does for its options.
+    fn expand_user_path(&self, path: &str) -> String {
+        if path.starts_with('~') {
+            self.mpv.command_string(&["expand-path", path]).unwrap_or_else(|_| path.to_string())
+        } else {
+            path.to_string()
         }
-        self.osd(&msg, 5000);
     }
 
     fn create_room(&mut self, name: &str) {
@@ -431,7 +495,10 @@ impl Plugin {
         let notify = Arc::new(move |event: SessionEvent| {
             let (kind, text, extra) = match event {
                 SessionEvent::Status(t) => ("status", t, String::new()),
-                SessionEvent::WatchStarted { peer, name } => ("watch", name, peer.to_string()),
+                SessionEvent::WatchStarted { peer, name, audio } => {
+                    ("watch", name, format!("{peer}:{}", if audio { "audio" } else { "" }))
+                }
+                SessionEvent::AudioStarted { peer } => ("audio", String::new(), peer.to_string()),
                 SessionEvent::StreamEnded(t) => ("ended", t, String::new()),
                 SessionEvent::Failed(t) => ("failed", t, String::new()),
                 SessionEvent::RoomChanged => ("room", String::new(), String::new()),
@@ -461,7 +528,8 @@ impl Plugin {
         match kind {
             "status" => self.osd(text, 4000),
             "watch" => {
-                let Ok(peer) = extra.parse::<PeerId>() else { return };
+                let (peer, audio) = extra.split_once(':').unwrap_or((extra, ""));
+                let Ok(peer) = peer.parse::<PeerId>() else { return };
                 // Stale if the user has switched to someone else since.
                 if session.room_state().target != Some(peer) {
                     return;
@@ -473,12 +541,27 @@ impl Plugin {
                     return;
                 }
                 let title = text.replace(',', " ");
-                let options = LOW_LATENCY_OPTIONS.join(",") + &format!(",force-media-title={title} — room {room}");
+                let mut options = LOW_LATENCY_OPTIONS.join(",") + &format!(",force-media-title={title} — room {room}");
+                if audio == "audio" {
+                    // -append adds one entry; plain audio-files is a path list
+                    // and would split the URL at its ':'.
+                    options += &format!(",audio-files-append={}", stream::audio_url(&room, peer));
+                }
                 self.log_err("loadfile", self.mpv.command(&["loadfile", &url, "replace", "-1", &options]));
             }
             "ended" => {
                 self.draw_subtitle("");
                 self.osd(text, 6000);
+            }
+            "audio" => {
+                let Ok(peer) = extra.parse::<PeerId>() else { return };
+                // Only for the stream that's playing, and only once (a
+                // reconnect brings this again for a track that's there).
+                let url = stream::audio_url(&room, peer);
+                let playing = self.mpv.get_string("path").as_deref() == Some(stream::url(&room, peer).as_str());
+                if playing && !self.has_external_track(&url) {
+                    self.log_err("audio-add", self.mpv.command(&["audio-add", &url, "select"]));
+                }
             }
             "room" => self.draw_roster(),
             "sub" => self.draw_subtitle(text),
@@ -513,16 +596,35 @@ impl Plugin {
             let cwd = self.mpv.get_string("working-directory").unwrap_or_default();
             Path::new(&cwd).join(&path).to_string_lossy().into_owned()
         };
+        // Stream the tracks being played (e.g. the chosen audio language).
+        // External tracks (separate files) aren't part of `source`.
+        let track = |kind: &str| -> Option<i64> {
+            let internal = self.mpv.get_bool(&format!("current-tracks/{kind}/external")) == Some(false);
+            internal.then(|| self.mpv.get_string(&format!("current-tracks/{kind}/ff-index"))?.parse().ok()).flatten()
+        };
+        let audio = match (self.mpv.get_string("aid").as_deref(), track("audio")) {
+            (Some("no"), _) => ffmpeg::AudioChoice::Off,
+            (_, Some(i)) => ffmpeg::AudioChoice::Stream(i),
+            _ => ffmpeg::AudioChoice::First,
+        };
         let remote = self.mpv.remote();
         session.start_streaming(ffmpeg::StreamSource {
             path: source,
             title: self.mpv.get_string("media-title").unwrap_or(path),
-            ffmpeg: self.script_opt("mpvlink-ffmpeg").unwrap_or_else(|| "ffmpeg".into()),
+            video_stream: track("video"),
+            audio,
+            ffmpeg: self.ffmpeg_setting(),
             kbps: self.script_opt("mpvlink-kbps").and_then(|k| k.parse().ok()).unwrap_or(DEFAULT_KBPS),
             clock: Arc::new(move || remote.get_f64("time-pos")),
             seeks: self.seeks.clone(),
         });
         self.send_subtitle();
+    }
+
+    /// Whether a track loaded from `url` (e.g. our audio stream) is there.
+    fn has_external_track(&self, url: &str) -> bool {
+        let count = self.mpv.get_f64("track-list/count").unwrap_or(0.0) as usize;
+        (0..count).any(|i| self.mpv.get_string(&format!("track-list/{i}/external-filename")).as_deref() == Some(url))
     }
 
     fn streaming(&self) -> bool {
@@ -648,6 +750,13 @@ impl Plugin {
                     self.send_subtitle();
                 }
             }
+            // Another audio (or video) track while streaming: restart the
+            // stream with it, from the current position. Viewers stay connected.
+            OBSERVE_TRACKS => {
+                if self.streaming() && self.mpv.get_bool("idle-active") == Some(false) {
+                    self.on_file_loaded();
+                }
+            }
             // Nothing playing any more: nothing to stream.
             OBSERVE_IDLE => {
                 if self.mpv.get_bool("idle-active") == Some(true)
@@ -671,6 +780,8 @@ impl Plugin {
         self.log_err("observe", self.mpv.observe(OBSERVE_SUB, "sub-text"));
         self.log_err("observe", self.mpv.observe(OBSERVE_SUB, "sub-visibility"));
         self.log_err("observe", self.mpv.observe(OBSERVE_IDLE, "idle-active"));
+        self.log_err("observe", self.mpv.observe(OBSERVE_TRACKS, "aid"));
+        self.log_err("observe", self.mpv.observe(OBSERVE_TRACKS, "vid"));
         // Launched with nothing to play (e.g. `mpv --idle`): go straight to the menu.
         if self.mpv.get_bool("idle-active") == Some(true) {
             self.open_menu();
