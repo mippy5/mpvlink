@@ -8,9 +8,11 @@
 //! ffmpeg at the new position.
 
 use crate::mpegts::{Kind, TsDemuxer, TsFrame, opus_samples};
+use crate::substyle::{AssHeader, SubStyle};
 use mpvlink_rtc::h264::is_keyframe;
 use mpvlink_rtc::publish::Frame;
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::collections::VecDeque;
@@ -46,6 +48,14 @@ const AUDIO_LEAD: f64 = 0.1;
 /// Audio this late is dropped: sending it would only add delay on the other side.
 const AUDIO_MAX_LATE: f64 = 0.25;
 
+/// Where image subtitle lines usually are (fraction of the height from the
+/// top): what `sub-scale` scales them about.
+const IMAGE_SUB_ANCHOR: f64 = 0.9;
+
+/// Image subtitles are read from this many seconds before the position, to
+/// catch any already on screen there.
+const SUBTITLE_LOOKBACK: f64 = 10.0;
+
 /// Which audio to stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioChoice {
@@ -57,6 +67,37 @@ pub enum AudioChoice {
     First,
 }
 
+/// A subtitle track to draw into the video.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BurnIn {
+    /// Bitmaps (Blu-ray PGS, DVD), laid over the picture.
+    Image {
+        /// The file they're in, if not the one being streamed.
+        file: Option<String>,
+        /// ffmpeg's stream index in that file.
+        stream: i64,
+        /// mpv's `sub-delay`, in seconds.
+        delay: f64,
+        style: SubStyle,
+    },
+    /// Text (ASS, SRT, WebVTT…), rendered with libass like mpv does,
+    /// including fonts attached to the file.
+    Text {
+        /// The file they're in, if not the one being streamed.
+        file: Option<String>,
+        /// Which of that file's subtitle streams (0 = the first).
+        index: usize,
+        /// Seconds to add to a playback position to get subtitle time: the
+        /// file's start time, minus mpv's `sub-delay`.
+        shift: f64,
+        /// ASS (styled by the file) rather than plain text (styled by mpv).
+        ass: bool,
+        /// The video's width / height, for plain text's canvas.
+        aspect: f64,
+        style: SubStyle,
+    },
+}
+
 pub struct StreamSource {
     /// Absolute file path, or an http(s) URL.
     pub path: String,
@@ -64,9 +105,8 @@ pub struct StreamSource {
     /// The file's video stream to send (ffmpeg's index), else the first.
     pub video_stream: Option<i64>,
     pub audio: AudioChoice,
-    /// An image-based subtitle stream (Blu-ray PGS, DVD) to draw onto the
-    /// video. Viewers can only get text subtitles separately.
-    pub burn_subtitles: Option<i64>,
+    /// Subtitles to draw into the video, as mpv shows them.
+    pub subtitles: Option<BurnIn>,
     /// The ffmpeg executable.
     pub ffmpeg: String,
     pub kbps: u32,
@@ -79,6 +119,9 @@ pub struct StreamSource {
 pub enum PipelineEvent {
     /// Encoding works; `encoder` is the one in use.
     Started { encoder: String },
+    /// This ffmpeg can't draw text subtitles (no libass): they're left out
+    /// of the video, so viewers need them as text instead.
+    TextSubtitlesUnsupported,
     /// Streaming can't continue.
     Failed(String),
 }
@@ -100,7 +143,7 @@ impl Pipeline {
         let (s, c) = (stop.clone(), child.clone());
         let thread = std::thread::Builder::new()
             .name("mpvlink-ffmpeg".into())
-            .spawn(move || Runner { source, frames, events, stop: s, child: c }.run())
+            .spawn(move || Runner { source, frames, events, stop: s, child: c, extras: Extras::default() }.run())
             .ok();
         Self { stop, child, thread }
     }
@@ -144,6 +187,17 @@ struct Runner {
     events: tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
     stop: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
+    /// What ffmpeg's subtitle drawing needs besides the source.
+    extras: Extras,
+}
+
+/// Prepared once per stream for drawing text subtitles.
+#[derive(Default)]
+struct Extras {
+    /// The streamed file's attached fonts, for subtitles from another file.
+    fonts: Option<FontsDir>,
+    /// libass style overrides: mpv's subtitle style options.
+    force_style: String,
 }
 
 impl Runner {
@@ -154,6 +208,25 @@ impl Runner {
                 if !found.opus {
                     self.source.audio = AudioChoice::Off;
                     eprintln!("[mpvlink] this ffmpeg has no libopus: streaming video only");
+                }
+                if !found.libass && matches!(self.source.subtitles, Some(BurnIn::Text { .. })) {
+                    self.source.subtitles = None;
+                    eprintln!("[mpvlink] this ffmpeg has no libass: sending subtitles as text");
+                    let _ = self.events.send(PipelineEvent::TextSubtitlesUnsupported);
+                }
+                // mpv draws a separate subtitle file with the fonts attached
+                // to the video (common with anime releases); so must we.
+                if let Some(BurnIn::Text { file, index, ass, aspect, style, .. }) = &self.source.subtitles {
+                    if file.is_some() && !self.source.path.contains("://") {
+                        self.extras.fonts = FontsDir::extract(&self.source.ffmpeg, &self.source.path);
+                    }
+                    self.extras.force_style = if *ass {
+                        let file = file.as_deref().unwrap_or(&self.source.path);
+                        let header = ass_header(&self.source.ffmpeg, file, *index).unwrap_or_default();
+                        style.ass(&AssHeader::parse(&header))
+                    } else {
+                        style.plain_text(*aspect)
+                    };
                 }
                 found.video
             }
@@ -211,7 +284,7 @@ impl Runner {
 
     /// Run ffmpeg from `start` seconds and pace its frames to mpv's clock.
     fn encode_from(&self, start: f64, encoder: &str, announced: &mut bool) -> Ended {
-        let mut command = ffmpeg_command(&self.source, start, encoder);
+        let mut command = ffmpeg_command(&self.source, start, encoder, &self.extras);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => return Ended::NoOutput(e.to_string()),
@@ -425,7 +498,7 @@ fn read_frames(mut stdout: impl Read, tx: SyncSender<TsFrame>) {
     }
 }
 
-fn ffmpeg_command(source: &StreamSource, start: f64, encoder: &str) -> Command {
+fn ffmpeg_command(source: &StreamSource, start: f64, encoder: &str, extras: &Extras) -> Command {
     let mut c = Command::new(&source.ffmpeg);
     c.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     if start > 0.0 {
@@ -436,10 +509,73 @@ fn ffmpeg_command(source: &StreamSource, start: f64, encoder: &str) -> Command {
     c.args(["-i", &source.path]);
     // At most 1080p, 8-bit 4:2:0 (what every H.264 decoder handles).
     let scale = "scale=w='min(iw,1920)':h='min(ih,1080)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p";
-    match source.burn_subtitles {
-        // Subtitle images are drawn at the source resolution, then scaled
-        // with the picture; "pass" keeps the video going after the last one.
-        Some(subs) => c.args(["-filter_complex", &format!("[{video}][0:{subs}]overlay=eof_action=pass,{scale}[v]"), "-map", "[v]"]),
+    // Subtitles are drawn at the source resolution, then scaled with the picture.
+    let graph = match &source.subtitles {
+        None => None,
+        Some(BurnIn::Image { file, stream, delay, style }) => {
+            // The subtitles get their own input: a seek skips subtitles that
+            // started before it but are still on screen, so it's read from a
+            // little earlier, keeping everything read (-noaccurate_seek).
+            // Its timestamps count from where it was sought to, and an
+            // offset lines that up with the video, `delay` later. (A web
+            // stream only gets that with a delay: it means reading the file
+            // twice.)
+            let input = if file.is_some() || *delay != 0.0 || !source.path.contains("://") {
+                let from = start - delay;
+                let seek = (from - SUBTITLE_LOOKBACK).max(0.0);
+                if seek > 0.0 {
+                    c.args(["-noaccurate_seek", "-ss", &format!("{seek:.3}")]);
+                }
+                let offset = seek - from;
+                if offset.abs() >= 0.0005 {
+                    c.args(["-itsoffset", &format!("{offset:.3}")]);
+                }
+                c.args(["-i", file.as_deref().unwrap_or(&source.path)]);
+                1
+            } else {
+                0
+            };
+            // Scaled and raised. mpv scales each bitmap about its own center;
+            // here the whole subtitle layer is scaled about where subtitle
+            // lines usually are, which puts those in the same place.
+            let (size, raise) = style.image();
+            let mut subs = Vec::new();
+            if size != 1.0 {
+                subs.push(format!("scale=w=iw*{size}:h=ih*{size}"));
+            }
+            if style.gray {
+                subs.push("colorchannelmixer=.3:.59:.11:0:.3:.59:.11:0:.3:.59:.11".to_string());
+            }
+            let subs = if subs.is_empty() { "null".to_string() } else { subs.join(",") };
+            let mut y = if size != 1.0 { format!("{IMAGE_SUB_ANCHOR}*(H-h)") } else { "0".to_string() };
+            if raise != 0.0 {
+                y += &format!("-{raise:.4}*H");
+            }
+            // "pass" keeps the video going after the last subtitle.
+            Some(format!(
+                "[{input}:{stream}]{subs}[s];[{video}][s]overlay=x=(W-w)/2:y={y}:eof_action=pass,{scale}[v]"
+            ))
+        }
+        Some(BurnIn::Text { file, index, shift, .. }) => {
+            // libass reads the subtitles (and attached fonts) from the file
+            // itself and draws by timestamp, but after -ss ours start at 0:
+            // shift them to subtitle time and back.
+            let file = filter_value(file.as_deref().unwrap_or(&source.path));
+            let offset = start + shift;
+            let to_subs = format!("setpts=PTS{offset:+.3}/TB");
+            let back = format!("setpts=PTS{:+.3}/TB", -offset);
+            let mut options = format!("filename={file}:si={index}");
+            if let Some(fonts) = &extras.fonts {
+                options += &format!(":fontsdir={}", filter_value(&fonts.0.to_string_lossy()));
+            }
+            if !extras.force_style.is_empty() {
+                options += &format!(":force_style={}", filter_value(&extras.force_style));
+            }
+            Some(format!("[{video}]{to_subs},subtitles={options},{back},{scale}[v]"))
+        }
+    };
+    match graph {
+        Some(graph) => c.args(["-filter_complex", &graph, "-map", "[v]"]),
         None => c.args(["-map", &video, "-vf", scale]),
     };
     let audio = match source.audio {
@@ -521,16 +657,91 @@ struct Encoders {
     video: Vec<&'static str>,
     /// libopus, for audio.
     opus: bool,
+    /// The `subtitles` filter (libass), for text subtitles.
+    libass: bool,
 }
 
 /// The encoders this ffmpeg has.
 fn available_encoders(ffmpeg: &str) -> std::io::Result<Encoders> {
+    let list = |what: &str| -> std::io::Result<String> {
+        let mut c = Command::new(ffmpeg);
+        c.args(["-hide_banner", what]).stdin(Stdio::null()).stderr(Stdio::null());
+        hide_console_window(&mut c);
+        Ok(String::from_utf8_lossy(&c.output()?.stdout).into_owned())
+    };
+    let (encoders, filters) = (list("-encoders")?, list("-filters")?);
+    let has = |listing: &str, name: &str| listing.split_whitespace().any(|word| word == name);
+    Ok(Encoders {
+        video: ENCODERS.iter().copied().filter(|e| has(&encoders, e)).collect(),
+        opus: has(&encoders, "libopus"),
+        libass: has(&filters, "subtitles"),
+    })
+}
+
+/// The header of an ASS subtitle stream (styles, canvas size): the
+/// `index`th subtitle stream of `file`. Only the header is read.
+fn ass_header(ffmpeg: &str, file: &str, index: usize) -> Option<String> {
     let mut c = Command::new(ffmpeg);
-    c.args(["-hide_banner", "-encoders"]).stdin(Stdio::null()).stderr(Stdio::null());
+    c.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i", file])
+        .args(["-map", &format!("0:s:{index}"), "-c:s", "copy", "-frames:s", "0", "-f", "ass", "-"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
     hide_console_window(&mut c);
-    let listing = String::from_utf8_lossy(&c.output()?.stdout).into_owned();
-    let has = |name: &str| listing.split_whitespace().any(|word| word == name);
-    Ok(Encoders { video: ENCODERS.iter().copied().filter(|e| has(e)).collect(), opus: has("libopus") })
+    let out = c.output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned()).filter(|h| !h.is_empty())
+}
+
+/// A temporary folder of fonts, deleted when dropped.
+struct FontsDir(PathBuf);
+
+impl FontsDir {
+    /// Copy the fonts attached to `video` (MKV attachments) into a new
+    /// temporary folder; None if it has none.
+    fn extract(ffmpeg: &str, video: &str) -> Option<Self> {
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = COUNT.fetch_add(1, Ordering::SeqCst);
+        let dir = Self(std::env::temp_dir().join(format!("mpvlink-fonts-{}-{n}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).ok()?;
+        // Attachments are written (under their own names, into the current
+        // folder) when the input opens; nothing else is decoded.
+        let mut c = Command::new(ffmpeg);
+        c.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-dump_attachment:t", "", "-i", video])
+            .args(["-t", "0", "-f", "null", "-"])
+            .current_dir(&dir.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_console_window(&mut c);
+        let _ = c.status();
+        let found = std::fs::read_dir(&dir.0).ok()?.count();
+        (found > 0).then(|| {
+            eprintln!("[mpvlink] using {found} fonts attached to the video for subtitles");
+            dir
+        })
+    }
+}
+
+impl Drop for FontsDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `value` as a filter option in a -filter_complex graph: escaped for the
+/// option parser (`:` separates options), then for the graph parser
+/// (`[` `]` are labels, `,` `;` separate filters). File paths need this.
+fn filter_value(value: &str) -> String {
+    let escape = |s: &str, special: &str| {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            if special.contains(c) {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
+    };
+    escape(&escape(value, "\\':"), "\\'[],;")
 }
 
 /// ffmpeg is a console program; on Windows, don't flash a console window.
@@ -542,4 +753,101 @@ fn hide_console_window(c: &mut Command) {
         c.creation_flags(CREATE_NO_WINDOW);
     }
     let _ = c;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(subtitles: Option<BurnIn>) -> StreamSource {
+        StreamSource {
+            path: "/videos/Show [BD][1080p]/ep 1, part 2.mkv".into(),
+            title: "ep".into(),
+            video_stream: None,
+            audio: AudioChoice::Off,
+            subtitles,
+            ffmpeg: "ffmpeg".into(),
+            kbps: 1000,
+            clock: Arc::new(|| None),
+            seeks: Arc::default(),
+        }
+    }
+
+    fn args(source: &StreamSource, start: f64) -> Vec<String> {
+        ffmpeg_command(source, start, "libx264", &Extras::default()).get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    fn graph(args: &[String]) -> &str {
+        let i = args.iter().position(|a| a == "-filter_complex").expect("a filter graph");
+        &args[i + 1]
+    }
+
+    #[test]
+    fn filter_values_are_escaped_for_both_parsers() {
+        assert_eq!(filter_value("/a/b.mkv"), "/a/b.mkv");
+        assert_eq!(filter_value("/x [BD]/a, b;c.mkv"), r"/x \[BD\]/a\, b\;c.mkv");
+        // Option level first (\: \\ \'), then graph level (\\ \').
+        assert_eq!(filter_value(r"C:\Videos\it's.mkv"), r"C\\:\\\\Videos\\\\it\\\'s.mkv");
+    }
+
+    #[test]
+    fn text_subtitles_are_drawn_at_subtitle_time() {
+        let text = BurnIn::Text { file: None, index: 1, shift: -0.5, ass: true, aspect: 1.0, style: SubStyle::default() };
+        let args = args(&source(Some(text)), 600.0);
+        assert!(graph(&args).starts_with(
+            r"[0:v:0]setpts=PTS+599.500/TB,subtitles=filename=/videos/Show \[BD\]\[1080p\]/ep 1\, part 2.mkv:si=1,setpts=PTS-599.500/TB,scale="
+        ));
+        assert_eq!(args.iter().filter(|a| *a == "-i").count(), 1);
+    }
+
+    #[test]
+    fn separate_image_subtitles_are_a_second_input() {
+        let image = BurnIn::Image { file: Some("/videos/ep.sup".into()), stream: 0, delay: 0.0, style: SubStyle::default() };
+        let args = args(&source(Some(image)), 12.0);
+        let inputs: Vec<_> = args.windows(2).filter(|w| w[0] == "-i").map(|w| w[1].as_str()).collect();
+        assert_eq!(inputs, [source(None).path.as_str(), "/videos/ep.sup"]);
+        assert!(graph(&args).starts_with("[1:0]null[s];[0:v:0][s]overlay=x=(W-w)/2:y=0:eof_action=pass,scale="));
+        assert_eq!(args.iter().filter(|a| *a == "-ss").count(), 2);
+    }
+
+    #[test]
+    fn image_subtitles_take_delay_scale_and_position() {
+        let style = SubStyle { scale: 1.5, pos: 90.0, ..SubStyle::default() };
+        let image = |delay| BurnIn::Image { file: None, stream: 3, delay, style: style.clone() };
+        // Delayed 2 s: the file again, as a second input, read from 10 s
+        // before 2 s earlier, and offset to match.
+        let delayed = args(&source(Some(image(2.0))), 30.0);
+        let flag = |args: &[String], name: &str| -> Vec<String> {
+            args.windows(2).filter(|w| w[0] == name).map(|w| w[1].clone()).collect()
+        };
+        assert_eq!(flag(&delayed, "-ss"), ["30.000", "18.000"]);
+        assert_eq!(flag(&delayed, "-itsoffset"), ["-10.000"]);
+        assert!(graph(&delayed).starts_with(
+            "[1:3]scale=w=iw*1.5:h=ih*1.5[s];[0:v:0][s]overlay=x=(W-w)/2:y=0.9*(H-h)-0.1000*H:eof_action=pass,scale="
+        ));
+        // Near the start: from the start, offset by what's left.
+        let early = args(&source(Some(image(4.0))), 1.0);
+        assert_eq!(flag(&early, "-ss"), ["1.000"]);
+        assert_eq!(flag(&early, "-itsoffset"), ["3.000"]);
+        // A web stream without a delay: from the same input.
+        let web = StreamSource { path: "https://example.com/a.mkv".into(), ..source(Some(image(0.0))) };
+        assert!(graph(&args(&web, 10.0)).starts_with("[0:3]scale="));
+    }
+
+    #[test]
+    fn text_style_overrides_are_escaped() {
+        let text = BurnIn::Text { file: None, index: 0, shift: 0.0, ass: false, aspect: 1.0, style: SubStyle::default() };
+        let extras = Extras { fonts: None, force_style: "FontName=Foo: Bar,MarginV=3".into() };
+        let args: Vec<String> = ffmpeg_command(&source(Some(text)), 0.0, "libx264", &extras)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(graph(&args).contains(r":si=0:force_style=FontName=Foo\\: Bar\,MarginV=3,setpts="));
+    }
+
+    #[test]
+    fn no_subtitles_no_graph() {
+        let args = args(&source(None), 0.0);
+        assert!(!args.iter().any(|a| a == "-filter_complex"));
+    }
 }

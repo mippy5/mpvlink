@@ -42,8 +42,8 @@ mpv 0.37 or newer is needed on Windows (see [docs/windows.md](docs/windows.md)).
 On macOS, a downloaded plugin may be blocked until you run
 `xattr -d com.apple.quarantine ~/.config/mpv/scripts/mpvlink.so`.
 
-To stream your own videos you also need ffmpeg (with libopus for audio,
-which most builds include).
+To stream your own videos you also need ffmpeg (with libopus for audio and
+libass for subtitles, which most builds include).
 
 ### 2. Point it at a signaling server
 
@@ -87,8 +87,8 @@ Settings saved in the Settings page can be overridden with `--script-opts`
 - No TURN relay yet, so two people behind strict NATs or firewalls may not be
   able to connect directly (the signaling works, but no video arrives).
 - Streams are H.264 up to 1080p; HDR is converted without tone mapping.
-- Text subtitles are sent as plain lines; image subtitles (Blu-ray PGS, DVD)
-  are burned into the video.
+- Subtitles are burned into the video, with your mpv subtitle delay and style
+  settings (viewers can't turn them off).
 - Only files and `http(s)://` links can be streamed, not YouTube links, and
   not window or screen capture (planned).
 

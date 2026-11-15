@@ -30,6 +30,7 @@ mod room;
 mod roster;
 mod session;
 mod stream;
+mod substyle;
 mod webm;
 
 use menu::{Action, Layout, Menu, SettingsContext, SettingsField, SettingsValues};
@@ -51,6 +52,16 @@ const OBSERVE_MOUSE: u64 = 2;
 const OBSERVE_SUB: u64 = 3;
 const OBSERVE_IDLE: u64 = 4;
 const OBSERVE_TRACKS: u64 = 5;
+
+/// mpv options that change how our stream's subtitles are drawn (read in
+/// `sub_style`); changing one restarts the stream with it.
+const SUB_STYLE_OPTIONS: &[&str] = &[
+    "sub-ass-override", "sub-font", "sub-font-size", "sub-scale", "sub-scale-signs", "sub-color",
+    "sub-outline-color", "sub-border-color", "sub-back-color", "sub-outline-size", "sub-border-size",
+    "sub-shadow-offset", "sub-border-style", "sub-bold", "sub-italic", "sub-blur", "sub-spacing",
+    "sub-margin-x", "sub-margin-y", "sub-pos", "sub-align-x", "sub-align-y", "sub-ass-style-overrides",
+    "sub-gray",
+];
 
 const GLOBAL_SECTION: &str = "mpvlink-global";
 const MENU_SECTION: &str = "mpvlink-menu";
@@ -139,8 +150,10 @@ struct Plugin {
     subtitle: String,
     /// Counts finished seeks, for our stream to follow.
     seeks: Arc<AtomicU64>,
-    /// The image subtitle stream our current stream has drawn in, if any.
-    burned_subtitles: Option<i64>,
+    /// The subtitles our current stream has drawn in, if any.
+    burned_subtitles: Option<ffmpeg::BurnIn>,
+    /// The file (or URL) our current stream is of.
+    streamed_path: String,
 }
 
 impl Plugin {
@@ -160,6 +173,7 @@ impl Plugin {
             subtitle: String::new(),
             seeks: Arc::new(AtomicU64::new(0)),
             burned_subtitles: None,
+            streamed_path: String::new(),
         }
     }
 
@@ -614,8 +628,9 @@ impl Plugin {
             (_, Some(i)) => ffmpeg::AudioChoice::Stream(i),
             _ => ffmpeg::AudioChoice::First,
         };
-        let burn_subtitles = self.image_subtitles();
-        self.burned_subtitles = burn_subtitles;
+        let subtitles = self.burn_in(&source);
+        self.burned_subtitles = subtitles.clone();
+        self.streamed_path = source.clone();
         let remote = self.mpv.remote();
         let Some(session) = &self.session else { return };
         session.start_streaming(ffmpeg::StreamSource {
@@ -623,7 +638,7 @@ impl Plugin {
             title: self.mpv.get_string("media-title").unwrap_or(path),
             video_stream: track("video"),
             audio,
-            burn_subtitles,
+            subtitles,
             ffmpeg: self.ffmpeg_setting(),
             kbps: self.script_opt("mpvlink-kbps").and_then(|k| k.parse().ok()).unwrap_or(DEFAULT_KBPS),
             clock: Arc::new(move || remote.get_f64("time-pos")),
@@ -632,20 +647,100 @@ impl Plugin {
         self.send_subtitle();
     }
 
-    /// The subtitle stream to draw into our stream: the one shown, if it's
-    /// image-based (no text to send viewers separately) and part of the file.
-    fn image_subtitles(&self) -> Option<i64> {
+    /// The subtitles to draw into our stream of `source`: the track mpv
+    /// shows, from the file or a separate subtitle file.
+    fn burn_in(&self, source: &str) -> Option<ffmpeg::BurnIn> {
         const IMAGE_CODECS: &[&str] = &["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"];
-        if self.mpv.get_bool("sub-visibility") == Some(false)
-            || self.mpv.get_bool("current-tracks/sub/external") != Some(false)
-        {
+        if self.mpv.get_bool("sub-visibility") == Some(false) {
             return None;
         }
-        let codec = self.mpv.get_string("current-tracks/sub/codec")?;
-        if !IMAGE_CODECS.contains(&codec.as_str()) {
+        let sub = |key: &str| self.mpv.get_string(&format!("current-tracks/sub/{key}"));
+        let stream: i64 = sub("ff-index")?.parse().ok()?;
+        let local = |f: String| f.strip_prefix("file://").map_or(f.clone(), str::to_string);
+        let file = if self.mpv.get_bool("current-tracks/sub/external")? {
+            // A separate subtitle file; only local ones (ffmpeg reads them whole).
+            let file = local(sub("external-filename")?);
+            if file.contains("://") {
+                return None;
+            }
+            Some(file)
+        } else {
+            None
+        };
+        let codec = sub("codec")?;
+        let delay = self.mpv.get_f64("sub-delay").unwrap_or(0.0);
+        let style = self.sub_style();
+        if IMAGE_CODECS.contains(&codec.as_str()) {
+            return Some(ffmpeg::BurnIn::Image { file, stream, delay, style });
+        }
+        // Text: libass reads the whole subtitle track up front, which for a
+        // web stream means downloading all of it; viewers get lines instead.
+        if file.is_none() && source.contains("://") {
             return None;
         }
-        self.mpv.get_string("current-tracks/sub/ff-index")?.parse().ok()
+        // libass wants the position among the file's subtitle streams.
+        let count = self.mpv.get_f64("track-list/count").unwrap_or(0.0) as usize;
+        let track = |i: usize, key: &str| self.mpv.get_string(&format!("track-list/{i}/{key}"));
+        let index = (0..count)
+            .filter(|&i| track(i, "type").as_deref() == Some("sub"))
+            .filter(|&i| track(i, "external-filename").map(local) == file)
+            .filter(|&i| track(i, "ff-index").and_then(|f| f.parse::<i64>().ok()).is_some_and(|f| f < stream))
+            .count();
+        // Subtitle times inside the file count from its start time (mpv's
+        // positions from 0); a separate subtitle file's from 0.
+        let start = if file.is_none() { self.mpv.get_f64("demuxer-start-time").unwrap_or(0.0) } else { 0.0 };
+        let size = |key: &str| self.mpv.get_f64(&format!("video-params/{key}")).filter(|v| *v > 0.0);
+        let aspect = size("w").zip(size("h")).map_or(16.0 / 9.0, |(w, h)| w / h);
+        let ass = matches!(codec.as_str(), "ass" | "ssa");
+        Some(ffmpeg::BurnIn::Text { file, index, shift: start - delay, ass, aspect, style })
+    }
+
+    /// mpv's subtitle style options, to draw our stream's subtitles with.
+    fn sub_style(&self) -> substyle::SubStyle {
+        let d = substyle::SubStyle::default();
+        let string = |key: &str| self.mpv.get_string(key);
+        let number = |key: &str, default: f64| self.mpv.get_f64(key).unwrap_or(default);
+        let flag = |key: &str| self.mpv.get_bool(key) == Some(true);
+        // Newer names first; mpv before 0.38 has only the "border" ones.
+        let either = |new: &str, old: &str| string(new).or_else(|| string(old));
+        substyle::SubStyle {
+            ass_override: substyle::AssOverride::parse(&string("sub-ass-override").unwrap_or_default()),
+            font: string("sub-font").filter(|f| !f.is_empty()).unwrap_or(d.font),
+            font_size: number("sub-font-size", d.font_size),
+            scale: number("sub-scale", d.scale),
+            scale_signs: flag("sub-scale-signs"),
+            color: string("sub-color").unwrap_or(d.color),
+            outline_color: either("sub-outline-color", "sub-border-color").unwrap_or(d.outline_color),
+            back_color: string("sub-back-color").unwrap_or(d.back_color),
+            outline_size: either("sub-outline-size", "sub-border-size").and_then(|v| v.parse().ok()).unwrap_or(d.outline_size),
+            shadow_offset: number("sub-shadow-offset", d.shadow_offset),
+            border_style: match string("sub-border-style").as_deref() {
+                Some("opaque-box") => 3,
+                Some("background-box") => 4,
+                _ => 1,
+            },
+            bold: flag("sub-bold"),
+            italic: flag("sub-italic"),
+            blur: number("sub-blur", d.blur),
+            spacing: number("sub-spacing", d.spacing),
+            margin_x: number("sub-margin-x", d.margin_x),
+            margin_y: number("sub-margin-y", d.margin_y),
+            pos: number("sub-pos", d.pos),
+            align_x: match string("sub-align-x").as_deref() {
+                Some("left") => -1,
+                Some("right") => 1,
+                _ => 0,
+            },
+            align_y: match string("sub-align-y").as_deref() {
+                Some("top") => -1,
+                Some("center") => 0,
+                _ => 1,
+            },
+            overrides: string("sub-ass-style-overrides")
+                .map(|o| o.split(',').filter(|o| !o.is_empty()).map(str::to_string).collect())
+                .unwrap_or_default(),
+            gray: flag("sub-gray"),
+        }
     }
 
     /// Whether a track loaded from `url` (e.g. our audio stream) is there.
@@ -775,9 +870,9 @@ impl Plugin {
             OBSERVE_SUB => {
                 if self.streaming() {
                     self.send_subtitle();
-                    // Image subtitles shown or hidden: they're part of the
-                    // picture, so the stream restarts with (or without) them.
-                    if self.image_subtitles() != self.burned_subtitles {
+                    // Subtitles shown, hidden, switched or moved: they're part
+                    // of the picture, so the stream restarts with the change.
+                    if self.burn_in(&self.streamed_path) != self.burned_subtitles {
                         self.on_file_loaded();
                     }
                 }
@@ -814,8 +909,13 @@ impl Plugin {
         self.log_err("observe", self.mpv.observe(OBSERVE_IDLE, "idle-active"));
         self.log_err("observe", self.mpv.observe(OBSERVE_TRACKS, "aid"));
         self.log_err("observe", self.mpv.observe(OBSERVE_TRACKS, "vid"));
-        // Subtitle track changes only matter for image subtitles (see OBSERVE_SUB).
+        // Subtitle changes restart our stream with them drawn in (see OBSERVE_SUB).
         self.log_err("observe", self.mpv.observe(OBSERVE_SUB, "sid"));
+        self.log_err("observe", self.mpv.observe(OBSERVE_SUB, "sub-delay"));
+        for option in SUB_STYLE_OPTIONS {
+            // Not every mpv version has every one.
+            let _ = self.mpv.observe(OBSERVE_SUB, option);
+        }
         // Launched with nothing to play (e.g. `mpv --idle`): go straight to the menu.
         if self.mpv.get_bool("idle-active") == Some(true) {
             self.open_menu();

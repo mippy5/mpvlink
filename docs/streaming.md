@@ -22,8 +22,8 @@ start, if there are several), and otherwise points at you.
 2. Drag a video into the mpv window, or open it any other way.
 
 Everyone watching you sees and hears what your mpv plays: pausing, seeking and
-changing speed all carry over, and the subtitle line you see is shown to them
-too. The audio is the track you're listening to (switch tracks, or turn audio
+changing speed all carry over, and the subtitles you see are drawn into the
+video, styled as in your mpv. The audio is the track you're listening to (switch tracks, or turn audio
 off, and your viewers follow).
 To stop, close the video or click someone else's name.
 
@@ -63,12 +63,23 @@ picture carries on.
 
 ## Current limitations
 
-- **Text subtitles** (SRT, ASS) are sent as plain lines: no positioning or
-  styling (signs, karaoke). Viewers' mpv draws them.
-- **Image subtitles** (Blu-ray PGS, DVD) have no text to send, so they're
-  drawn into the video instead. Viewers can't turn them off, and your
-  subtitle delay setting doesn't carry over. Hiding or switching them
-  restarts your stream briefly.
+- **Subtitles are part of the picture.** The track you have on (from the
+  file or a separate subtitle file) is drawn into the video by ffmpeg, with
+  libass for text formats like ASS and SRT, so signs and styling survive.
+  Viewers can't turn them off. Your subtitle delay and style settings
+  (`sub-font`, `sub-font-size`, `sub-scale`, `sub-pos`, `sub-color`,
+  `sub-border-style`, `sub-ass-override`, `sub-ass-style-overrides` and so
+  on) apply as in your mpv. Changing any of them, or hiding or switching
+  subtitles, restarts your stream briefly. Secondary subtitles aren't drawn.
+- **Close to mpv, not identical, in a few cases:** with `sub-ass-override`
+  set to `scale`, mpv guesses which ASS lines are dialogue to scale; here
+  that's every bottom-aligned style. `sub-ass-override=strip` is treated
+  like `force` (ASS override tags are kept). `sub-scale` on image subtitles
+  scales the whole subtitle layer about the usual subtitle line position,
+  where mpv scales each bitmap about its own center.
+- **When text subtitles can't be drawn** (an ffmpeg built without libass, or
+  streaming an http(s) link, where ffmpeg would have to download the whole
+  file first), viewers get the subtitle line as plain text instead.
 - **New viewers** start at the next keyframe, which comes every second, and a
   viewer recovers from packet loss the same way.
 - **HDR videos** are converted to 8-bit without tone mapping, so they look

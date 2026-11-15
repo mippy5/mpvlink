@@ -9,7 +9,7 @@
 //! the user picks someone, it follows whoever is streaming, else points at
 //! ourselves. While we're streaming it points at ourselves.
 
-use crate::ffmpeg::{Pipeline, PipelineEvent, StreamSource};
+use crate::ffmpeg::{BurnIn, Pipeline, PipelineEvent, StreamSource};
 use crate::stream::{self, AudioQueue, FrameQueue};
 use anyhow::{Context, Result, bail};
 use mpvlink_rtc::h264::{FrameAssembler, is_keyframe};
@@ -140,7 +140,7 @@ fn member(p: PeerInfo, you: bool) -> Member {
 /// Requests from the plugin thread.
 enum Command {
     Select(PeerId),
-    StartStreaming(StreamSource),
+    StartStreaming(Box<StreamSource>),
     StopStreaming,
     Subtitle(String),
 }
@@ -212,14 +212,15 @@ impl Session {
     /// Stream `source` (replacing anything we're streaming already). Only
     /// does anything while the arrow points at ourselves.
     pub fn start_streaming(&self, source: StreamSource) {
-        let _ = self.commands.send(Command::StartStreaming(source));
+        let _ = self.commands.send(Command::StartStreaming(Box::new(source)));
     }
 
     pub fn stop_streaming(&self) {
         let _ = self.commands.send(Command::StopStreaming);
     }
 
-    /// The subtitle line our own playback shows now, for our viewers.
+    /// The subtitle line our own playback shows now. Viewers get it as text
+    /// only when the stream doesn't have subtitles drawn in.
     pub fn subtitle(&self, text: String) {
         let _ = self.commands.send(Command::Subtitle(text));
     }
@@ -294,6 +295,8 @@ async fn run(
         publisher: None,
         pipeline: None,
         subtitle: String::new(),
+        subtitle_lines: false,
+        sent_subtitle: String::new(),
         joined: false,
         reconnecting: false,
     };
@@ -332,8 +335,12 @@ struct Room {
     /// Our own stream: viewers' connections, and the encoder feeding them.
     publisher: Option<Publisher>,
     pipeline: Option<Pipeline>,
-    /// The subtitle line our playback shows now (for new viewers too).
+    /// The subtitle line our playback shows now.
     subtitle: String,
+    /// Whether viewers get it as text (our stream has no text subtitles
+    /// drawn in), and what they were last sent.
+    subtitle_lines: bool,
+    sent_subtitle: String,
     joined: bool,
     reconnecting: bool,
 }
@@ -452,8 +459,8 @@ impl Room {
                 let Some(publisher) = self.publisher.as_mut() else { return };
                 let watch = matches!(signal, Signal::Watch);
                 publisher.handle(from, &name, &signal);
-                if watch && !self.subtitle.is_empty() {
-                    self.signaling.signal(from, Signal::Subtitle { text: self.subtitle.clone() });
+                if watch && !self.sent_subtitle.is_empty() {
+                    self.signaling.signal(from, Signal::Subtitle { text: self.sent_subtitle.clone() });
                 }
             }
             _ => {}
@@ -484,13 +491,15 @@ impl Room {
                     return;
                 }
                 let title = source.title.clone();
+                self.subtitle_lines = !matches!(source.subtitles, Some(BurnIn::Text { .. }));
+                self.send_subtitle();
                 let restart = self.pipeline.take().is_some(); // stop any previous one first
                 let publisher = self.publisher.get_or_insert_with(|| {
                     let log = Arc::new(|line: String| eprintln!("[mpvlink] {line}"));
                     Publisher::new(self.signaling.clone(), self.config.ice_servers.clone(), true, log)
                 });
                 let frames = publisher.frames();
-                self.pipeline = Some(Pipeline::start(source, frames, self.pipeline_events.clone()));
+                self.pipeline = Some(Pipeline::start(*source, frames, self.pipeline_events.clone()));
                 self.signaling.set_streaming(true);
                 self.chosen = true;
                 self.update(|s| s.set_my_streaming(true));
@@ -500,15 +509,22 @@ impl Room {
             }
             Command::StopStreaming => self.stop_streaming(None),
             Command::Subtitle(text) => {
-                if text == self.subtitle {
-                    return;
-                }
                 self.subtitle = text;
-                if let Some(p) = &self.publisher {
-                    for viewer in p.watchers() {
-                        self.signaling.signal(viewer, Signal::Subtitle { text: self.subtitle.clone() });
-                    }
-                }
+                self.send_subtitle();
+            }
+        }
+    }
+
+    /// Bring viewers' subtitle line up to date.
+    fn send_subtitle(&mut self) {
+        let text = if self.subtitle_lines { self.subtitle.as_str() } else { "" };
+        if text == self.sent_subtitle {
+            return;
+        }
+        self.sent_subtitle = text.to_string();
+        if let Some(p) = &self.publisher {
+            for viewer in p.watchers() {
+                self.signaling.signal(viewer, Signal::Subtitle { text: self.sent_subtitle.clone() });
             }
         }
     }
@@ -516,6 +532,10 @@ impl Room {
     fn on_pipeline(&mut self, event: PipelineEvent) {
         match event {
             PipelineEvent::Started { encoder } => eprintln!("[mpvlink] streaming with {encoder}"),
+            PipelineEvent::TextSubtitlesUnsupported => {
+                self.subtitle_lines = true;
+                self.send_subtitle();
+            }
             PipelineEvent::Failed(message) => self.stop_streaming(Some(message)),
         }
     }
@@ -527,6 +547,7 @@ impl Room {
         self.pipeline = None;
         self.publisher = None; // ends every viewer's connection
         self.subtitle.clear();
+        self.sent_subtitle.clear();
         self.signaling.set_streaming(false);
         self.update(|s| s.set_my_streaming(false));
         if let Some(message) = error {
