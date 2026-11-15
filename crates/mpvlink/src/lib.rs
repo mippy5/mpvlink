@@ -122,6 +122,8 @@ struct Plugin {
     subtitle: String,
     /// Counts finished seeks, for our stream to follow.
     seeks: Arc<AtomicU64>,
+    /// The image subtitle stream our current stream has drawn in, if any.
+    burned_subtitles: Option<i64>,
 }
 
 impl Plugin {
@@ -140,6 +142,7 @@ impl Plugin {
             roster_clicks: false,
             subtitle: String::new(),
             seeks: Arc::new(AtomicU64::new(0)),
+            burned_subtitles: None,
         }
     }
 
@@ -607,18 +610,38 @@ impl Plugin {
             (_, Some(i)) => ffmpeg::AudioChoice::Stream(i),
             _ => ffmpeg::AudioChoice::First,
         };
+        let burn_subtitles = self.image_subtitles();
+        self.burned_subtitles = burn_subtitles;
         let remote = self.mpv.remote();
+        let Some(session) = &self.session else { return };
         session.start_streaming(ffmpeg::StreamSource {
             path: source,
             title: self.mpv.get_string("media-title").unwrap_or(path),
             video_stream: track("video"),
             audio,
+            burn_subtitles,
             ffmpeg: self.ffmpeg_setting(),
             kbps: self.script_opt("mpvlink-kbps").and_then(|k| k.parse().ok()).unwrap_or(DEFAULT_KBPS),
             clock: Arc::new(move || remote.get_f64("time-pos")),
             seeks: self.seeks.clone(),
         });
         self.send_subtitle();
+    }
+
+    /// The subtitle stream to draw into our stream: the one shown, if it's
+    /// image-based (no text to send viewers separately) and part of the file.
+    fn image_subtitles(&self) -> Option<i64> {
+        const IMAGE_CODECS: &[&str] = &["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"];
+        if self.mpv.get_bool("sub-visibility") == Some(false)
+            || self.mpv.get_bool("current-tracks/sub/external") != Some(false)
+        {
+            return None;
+        }
+        let codec = self.mpv.get_string("current-tracks/sub/codec")?;
+        if !IMAGE_CODECS.contains(&codec.as_str()) {
+            return None;
+        }
+        self.mpv.get_string("current-tracks/sub/ff-index")?.parse().ok()
     }
 
     /// Whether a track loaded from `url` (e.g. our audio stream) is there.
@@ -748,6 +771,11 @@ impl Plugin {
             OBSERVE_SUB => {
                 if self.streaming() {
                     self.send_subtitle();
+                    // Image subtitles shown or hidden: they're part of the
+                    // picture, so the stream restarts with (or without) them.
+                    if self.image_subtitles() != self.burned_subtitles {
+                        self.on_file_loaded();
+                    }
                 }
             }
             // Another audio (or video) track while streaming: restart the
@@ -782,6 +810,8 @@ impl Plugin {
         self.log_err("observe", self.mpv.observe(OBSERVE_IDLE, "idle-active"));
         self.log_err("observe", self.mpv.observe(OBSERVE_TRACKS, "aid"));
         self.log_err("observe", self.mpv.observe(OBSERVE_TRACKS, "vid"));
+        // Subtitle track changes only matter for image subtitles (see OBSERVE_SUB).
+        self.log_err("observe", self.mpv.observe(OBSERVE_SUB, "sid"));
         // Launched with nothing to play (e.g. `mpv --idle`): go straight to the menu.
         if self.mpv.get_bool("idle-active") == Some(true) {
             self.open_menu();

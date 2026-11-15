@@ -64,6 +64,9 @@ pub struct StreamSource {
     /// The file's video stream to send (ffmpeg's index), else the first.
     pub video_stream: Option<i64>,
     pub audio: AudioChoice,
+    /// An image-based subtitle stream (Blu-ray PGS, DVD) to draw onto the
+    /// video. Viewers can only get text subtitles separately.
+    pub burn_subtitles: Option<i64>,
     /// The ffmpeg executable.
     pub ffmpeg: String,
     pub kbps: u32,
@@ -430,7 +433,15 @@ fn ffmpeg_command(source: &StreamSource, start: f64, encoder: &str) -> Command {
         c.args(["-ss", &format!("{start:.3}")]);
     }
     let video = source.video_stream.map_or_else(|| "0:v:0".to_string(), |i| format!("0:{i}"));
-    c.args(["-i", &source.path, "-map", &video]);
+    c.args(["-i", &source.path]);
+    // At most 1080p, 8-bit 4:2:0 (what every H.264 decoder handles).
+    let scale = "scale=w='min(iw,1920)':h='min(ih,1080)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p";
+    match source.burn_subtitles {
+        // Subtitle images are drawn at the source resolution, then scaled
+        // with the picture; "pass" keeps the video going after the last one.
+        Some(subs) => c.args(["-filter_complex", &format!("[{video}][0:{subs}]overlay=eof_action=pass,{scale}[v]"), "-map", "[v]"]),
+        None => c.args(["-map", &video, "-vf", scale]),
+    };
     let audio = match source.audio {
         AudioChoice::Off => None,
         AudioChoice::Stream(i) => Some(format!("0:{i}")),
@@ -443,11 +454,6 @@ fn ffmpeg_command(source: &StreamSource, start: f64, encoder: &str) -> Command {
         None => c.arg("-an"),
     };
     c.args(["-sn", "-dn"]);
-    // At most 1080p, 8-bit 4:2:0 (what every H.264 decoder handles).
-    c.args([
-        "-vf",
-        "scale=w='min(iw,1920)':h='min(ih,1080)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p",
-    ]);
     let kbps = source.kbps;
     let (rate, buffer) = (format!("{kbps}k"), format!("{}k", kbps / 2));
     c.args(["-c:v", encoder]);

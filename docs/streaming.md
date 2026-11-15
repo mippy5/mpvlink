@@ -63,8 +63,12 @@ picture carries on.
 
 ## Current limitations
 
-- **Subtitles** are sent as plain lines: no positioning or styling (signs,
-  karaoke), and no image-based subtitles (Blu-ray PGS).
+- **Text subtitles** (SRT, ASS) are sent as plain lines: no positioning or
+  styling (signs, karaoke). Viewers' mpv draws them.
+- **Image subtitles** (Blu-ray PGS, DVD) have no text to send, so they're
+  drawn into the video instead. Viewers can't turn them off, and your
+  subtitle delay setting doesn't carry over. Hiding or switching them
+  restarts your stream briefly.
 - **New viewers** start at the next keyframe, which comes every second, and a
   viewer recovers from packet loss the same way.
 - **HDR videos** are converted to 8-bit without tone mapping, so they look
