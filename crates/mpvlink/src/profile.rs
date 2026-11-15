@@ -18,6 +18,10 @@ pub struct Profile {
     pub server: String,
     /// ffmpeg executable for streaming; empty means find it automatically.
     pub ffmpeg: String,
+    /// Stream bitrate as `6000`, `source` or `1.5x`; empty means the default.
+    pub bitrate: String,
+    /// STUN server URL, `no` for none; empty means the default.
+    pub stun: String,
 }
 
 impl Profile {
@@ -50,6 +54,8 @@ impl Profile {
                 "name" => profile.display_name = value,
                 "server" => profile.server = value,
                 "ffmpeg" => profile.ffmpeg = value,
+                "bitrate" => profile.bitrate = value,
+                "stun" => profile.stun = value,
                 _ => {}
             }
         }
@@ -61,7 +67,13 @@ impl Profile {
         // control characters anyway so one value can't inject extra keys.
         let clean = |v: &str| v.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string();
         let mut out = String::from("# mpvlink profile\n");
-        for (key, value) in [("name", &self.display_name), ("server", &self.server), ("ffmpeg", &self.ffmpeg)] {
+        for (key, value) in [
+            ("name", &self.display_name),
+            ("server", &self.server),
+            ("ffmpeg", &self.ffmpeg),
+            ("bitrate", &self.bitrate),
+            ("stun", &self.stun),
+        ] {
             let value = clean(value);
             if !value.is_empty() {
                 out.push_str(&format!("{key}={value}\n"));
@@ -81,6 +93,8 @@ mod tests {
             display_name: "Zoë = the {cat}".into(),
             server: "wss://signal.example.com:8443/x?a=b".into(),
             ffmpeg: r"C:\Program Files\ffmpeg\bin\ffmpeg.exe".into(),
+            bitrate: "1.5x".into(),
+            stun: "stun:stun.example.com:3478".into(),
         };
         assert_eq!(Profile::parse(&p.serialize()), p);
         let no_server = Profile { display_name: "Ana".into(), ..Default::default() };

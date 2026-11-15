@@ -1,5 +1,5 @@
 //! The "Settings" page: the signaling server address and the ffmpeg used for
-//! streaming your own videos.
+//! streaming your own videos. Its "Advanced" button opens the advanced page.
 
 use super::{
     Action, ButtonKind, Caret, FieldView, Hit, Layout, MONO_FONT, PASTE_HINT, TEXT, TEXT_FAINT, WARNING,
@@ -174,12 +174,13 @@ impl SettingsMenu {
                 self.edited()
             }
             Hit::Field(i) => SettingsField::ALL.get(i).map_or(Action::None, |f| self.focus(*f)),
-            Hit::Header | Hit::None => Action::None,
+            Hit::Header => Action::OpenAdvanced,
+            Hit::None => Action::None,
         }
     }
 
     pub fn hover(&mut self, hit: Hit) -> Action {
-        let hit = if matches!(hit, Hit::Primary | Hit::Cancel | Hit::Left) { hit } else { Hit::None };
+        let hit = if matches!(hit, Hit::Primary | Hit::Cancel | Hit::Left | Hit::Header) { hit } else { Hit::None };
         if hit == self.hover {
             return Action::None;
         }
@@ -194,6 +195,7 @@ impl SettingsMenu {
     pub fn render(&self, l: &Layout) -> String {
         let mut ass = Ass::new();
         draw_panel(&mut ass, l, "Settings", "Changes apply the next time you join a room or stream a video.");
+        draw_button(&mut ass, l.header, "Advanced", ButtonKind::Ghost, self.hover == Hit::Header);
         let mono = || TextStyle { align: 4, size: 20.0, color: TEXT, font: Some(MONO_FONT), ..Default::default() };
 
         let default_server = format!("{} (this computer)", crate::DEFAULT_SERVER);
@@ -300,6 +302,7 @@ mod tests {
         m.focus_prev();
         assert_eq!(m.focus, SettingsField::Server);
         assert_eq!(m.click(l.hit(l.cancel.center())), Action::CloseSettings);
+        assert_eq!(m.click(l.hit(l.header.center())), Action::OpenAdvanced);
     }
 
     #[test]

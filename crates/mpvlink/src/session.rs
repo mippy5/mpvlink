@@ -531,7 +531,7 @@ impl Room {
 
     fn on_pipeline(&mut self, event: PipelineEvent) {
         match event {
-            PipelineEvent::Started { encoder } => eprintln!("[mpvlink] streaming with {encoder}"),
+            PipelineEvent::Started { encoder, kbps } => eprintln!("[mpvlink] streaming with {encoder} at {kbps} kb/s"),
             PipelineEvent::TextSubtitlesUnsupported => {
                 self.subtitle_lines = true;
                 self.send_subtitle();

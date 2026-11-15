@@ -1,12 +1,15 @@
-//! The plugin's menu: a panel drawn on the OSD with two pages, "Join a room"
-//! and "Settings". Shared layout and drawing widgets live here.
+//! The plugin's menu: a panel drawn on the OSD with three pages, "Join a
+//! room", "Settings" and "Advanced settings". Shared layout and drawing
+//! widgets live here.
 //!
 //! This module is pure logic (no mpv calls) so it stays easy to test; the
 //! plugin feeds it input and draws whatever `render` returns.
 
+mod advanced;
 mod join;
 mod settings;
 
+pub use advanced::{AdvancedContext, AdvancedMenu, AdvancedValues};
 pub use join::JoinMenu;
 pub use settings::{SettingsContext, SettingsField, SettingsMenu, SettingsValues};
 
@@ -62,6 +65,12 @@ pub enum Action {
     CloseSettings,
     /// Save settings and go back. Empty values mean "use the default".
     SaveSettings { values: SettingsValues },
+    /// Switch from settings to the advanced page.
+    OpenAdvanced,
+    /// Back to the settings page without saving.
+    CloseAdvanced,
+    /// Save the advanced settings and go back to the settings page.
+    SaveAdvanced { values: AdvancedValues },
 }
 
 // ---- Layout -----------------------------------------------------------------
@@ -76,7 +85,7 @@ pub enum Hit {
     Cancel,
     /// The bottom-left button (Create room / Use default).
     Left,
-    /// The small button at the top right (Settings).
+    /// The small button at the top right (Settings / Advanced).
     Header,
     Field(usize),
 }
@@ -299,26 +308,29 @@ fn draw_button(ass: &mut Ass, rect: Rect, label: &str, kind: ButtonKind, hovered
 
 // ---- The menu ---------------------------------------------------------------
 
-/// The open menu: the join page, with the settings page on top when open.
-/// Leaving settings returns to the join page with its fields as they were.
+/// The open menu: the join page, with the settings page on top when open,
+/// and the advanced page on top of that. Leaving a page returns to the one
+/// below with its fields as they were.
 pub struct Menu {
     join: JoinMenu,
     settings: Option<SettingsMenu>,
+    advanced: Option<AdvancedMenu>,
 }
 
 /// Forward a call to whichever page is showing.
 macro_rules! page {
     ($self:ident.$method:ident($($arg:expr),*)) => {
-        match &mut $self.settings {
-            Some(settings) => settings.$method($($arg),*),
-            None => $self.join.$method($($arg),*),
+        match (&mut $self.advanced, &mut $self.settings) {
+            (Some(advanced), _) => advanced.$method($($arg),*),
+            (None, Some(settings)) => settings.$method($($arg),*),
+            (None, None) => $self.join.$method($($arg),*),
         }
     };
 }
 
 impl Menu {
     pub fn new(name: &str) -> Self {
-        Self { join: JoinMenu::new(name), settings: None }
+        Self { join: JoinMenu::new(name), settings: None, advanced: None }
     }
 
     /// The display name as typed so far (untrimmed).
@@ -340,6 +352,19 @@ impl Menu {
 
     pub fn close_settings(&mut self) {
         self.settings = None;
+        self.advanced = None;
+    }
+
+    /// Show the advanced page with the saved `values` ("" = default).
+    pub fn open_advanced(&mut self, values: &AdvancedValues, context: AdvancedContext) {
+        if self.settings.is_some() {
+            self.advanced = Some(AdvancedMenu::new(values, context));
+        }
+    }
+
+    /// Back to the settings page.
+    pub fn close_advanced(&mut self) {
+        self.advanced = None;
     }
 
     pub fn in_settings(&self) -> bool {
@@ -348,7 +373,11 @@ impl Menu {
 
     /// Text fields on the current page, for the layout.
     pub fn field_count(&self) -> usize {
-        if self.settings.is_some() { SettingsMenu::FIELDS } else { JoinMenu::FIELDS }
+        match (&self.advanced, &self.settings) {
+            (Some(_), _) => AdvancedMenu::FIELDS,
+            (None, Some(_)) => SettingsMenu::FIELDS,
+            (None, None) => JoinMenu::FIELDS,
+        }
     }
 
     pub fn insert(&mut self, text: &str) -> Action {
@@ -376,13 +405,28 @@ impl Menu {
         page!(self.submit())
     }
 
-    /// Esc: back out of settings, or close the menu.
+    /// Left (-1) or Right (+1) arrow: only the advanced page's bitrate
+    /// choice uses them.
+    pub fn arrow(&mut self, by: isize) -> Action {
+        self.advanced.as_mut().map_or(Action::None, |a| a.arrow(by))
+    }
+
+    /// Esc: back out of the advanced page or settings, or close the menu.
     pub fn escape(&mut self) -> Action {
-        if self.settings.is_some() { Action::CloseSettings } else { Action::Close }
+        match (&self.advanced, &self.settings) {
+            (Some(_), _) => Action::CloseAdvanced,
+            (None, Some(_)) => Action::CloseSettings,
+            (None, None) => Action::Close,
+        }
     }
 
     pub fn click(&mut self, pos: (f64, f64), layout: &Layout) -> Action {
-        page!(self.click(layout.hit(pos)))
+        let hit = layout.hit(pos);
+        match (&mut self.advanced, &mut self.settings) {
+            (Some(advanced), _) => advanced.click(hit, pos, layout),
+            (None, Some(settings)) => settings.click(hit),
+            (None, None) => self.join.click(hit),
+        }
     }
 
     pub fn mouse_move(&mut self, pos: Option<(f64, f64)>, layout: &Layout) -> Action {
@@ -390,24 +434,27 @@ impl Menu {
         page!(self.hover(hit))
     }
 
-    pub fn caret_visible(&self) -> bool {
-        match &self.settings {
-            Some(s) => s.caret.visible(),
-            None => self.join.caret.visible(),
+    fn caret(&self) -> &Caret {
+        match (&self.advanced, &self.settings) {
+            (Some(a), _) => &a.caret,
+            (None, Some(s)) => &s.caret,
+            (None, None) => &self.join.caret,
         }
+    }
+
+    pub fn caret_visible(&self) -> bool {
+        self.caret().visible()
     }
 
     pub fn until_next_blink(&self) -> f64 {
-        match &self.settings {
-            Some(s) => s.caret.until_next_blink(),
-            None => self.join.caret.until_next_blink(),
-        }
+        self.caret().until_next_blink()
     }
 
     pub fn render(&self, layout: &Layout) -> String {
-        match &self.settings {
-            Some(s) => s.render(layout),
-            None => self.join.render(layout),
+        match (&self.advanced, &self.settings) {
+            (Some(a), _) => a.render(layout),
+            (None, Some(s)) => s.render(layout),
+            (None, None) => self.join.render(layout),
         }
     }
 }
@@ -418,7 +465,7 @@ mod tests {
 
     #[test]
     fn layout_fits_narrow_windows() {
-        for fields in [1, 2] {
+        for fields in [1, 2, 3] {
             let l = Layout::new(400.0, 900.0, fields);
             assert!(l.panel.x >= 0.0 && l.panel.x + l.panel.w <= l.res_x as f64);
             assert!(l.panel.y >= 0.0 && l.panel.y + l.panel.h <= l.res_y as f64);
@@ -427,7 +474,7 @@ mod tests {
 
     #[test]
     fn layout_keeps_fields_above_buttons_and_buttons_apart() {
-        for fields in [1, 2] {
+        for fields in [1, 2, 3] {
             let l = Layout::new(1280.0, 720.0, fields);
             let last = l.field(fields - 1);
             // Field + its message line must end before the buttons start.
@@ -446,6 +493,10 @@ mod tests {
         m.open_settings(&values, SettingsContext { ffmpeg_found: Err(String::new()), ..Default::default() });
         assert_eq!(m.field_count(), 2);
         m.insert("/x"); // goes to the settings field, not the room code
+        m.open_advanced(&AdvancedValues::default(), AdvancedContext::default());
+        assert_eq!(m.field_count(), 3);
+        assert_eq!(m.escape(), Action::CloseAdvanced);
+        m.close_advanced();
         assert_eq!(m.escape(), Action::CloseSettings);
         m.close_settings();
         assert_eq!(m.escape(), Action::Close);

@@ -9,17 +9,20 @@
 //!   script-binding mpvlink/toggle-menu  toggle the menu, for use in input.conf
 //!   script-binding mpvlink/settings     open the menu at the settings page
 //!
-//! Options (`--script-opts=key=value,...`); these override saved settings:
-//!   mpvlink-server=wss://host       signaling server (default: saved setting, else ws://127.0.0.1:8787)
+//! Options (`--script-opts=key=value,...`); these override saved settings
+//! (Settings, and its Advanced page):
+//!   mpvlink-server=wss://host       signaling server (default: ws://127.0.0.1:8787)
+//!   mpvlink-ffmpeg=/path/to/ffmpeg  ffmpeg for streaming your own videos (default: found on PATH)
+//!   mpvlink-kbps=6000               bitrate of your stream in kb/s, or "source", or e.g. "1.5x"
+//!                                   (times the source's); default 6000
 //!   mpvlink-stun=stun:host:port     STUN server, or "no" for none (default: Google's public one)
-//!   mpvlink-ffmpeg=/path/to/ffmpeg  ffmpeg for streaming your own videos (default: saved setting, else PATH)
-//!   mpvlink-kbps=6000               bitrate of your stream
 //!
 //! In a room, the member list (top left) shows an arrow at whose stream you're
 //! watching; click a name to switch. With the arrow on yourself, a video you
 //! open (e.g. drag into the window) is streamed to the room.
 
 mod ass;
+mod bitrate;
 mod ffi;
 mod ffmpeg;
 mod menu;
@@ -33,7 +36,8 @@ mod stream;
 mod substyle;
 mod webm;
 
-use menu::{Action, Layout, Menu, SettingsContext, SettingsField, SettingsValues};
+use bitrate::Bitrate;
+use menu::{Action, AdvancedContext, AdvancedValues, Layout, Menu, SettingsContext, SettingsField, SettingsValues};
 use mpv::{Event, Mpv};
 use profile::Profile;
 use mpvlink_rtc::proto::PeerId;
@@ -66,9 +70,6 @@ const SUB_STYLE_OPTIONS: &[&str] = &[
 const GLOBAL_SECTION: &str = "mpvlink-global";
 const MENU_SECTION: &str = "mpvlink-menu";
 const ROSTER_SECTION: &str = "mpvlink-roster";
-
-/// Bitrate of our own stream unless --script-opts says otherwise.
-const DEFAULT_KBPS: u32 = 6000;
 
 /// Client message the session uses to report back to the plugin thread.
 const SESSION_MESSAGE: &str = "mpvlink-session";
@@ -227,6 +228,8 @@ impl Plugin {
             format!("Ctrl+v {}", b("paste")),
             format!("Meta+v {}", b("paste")),
             format!("MBTN_LEFT {}", b("click")),
+            format!("LEFT {}", b("left")),
+            format!("RIGHT {}", b("right")),
         ]
         .join("\n");
         // define-section/enable-section are documented as deprecated for
@@ -425,7 +428,82 @@ impl Plugin {
                 self.redraw();
                 self.save_settings(values);
             }
+            Action::OpenAdvanced => {
+                let values = AdvancedValues { bitrate: self.profile.bitrate.clone(), stun: self.profile.stun.clone() };
+                let context = AdvancedContext {
+                    bitrate_override: self.script_opt("mpvlink-kbps"),
+                    stun_override: self.script_opt("mpvlink-stun"),
+                };
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.open_advanced(&values, context);
+                }
+                self.redraw();
+            }
+            Action::CloseAdvanced => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.close_advanced();
+                }
+                self.redraw();
+            }
+            Action::SaveAdvanced { values } => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.close_advanced();
+                }
+                self.redraw();
+                self.save_advanced(values);
+            }
         }
+    }
+
+    /// Persist the advanced settings ("" = default) and say what changed.
+    /// A new bitrate restarts our stream with it.
+    fn save_advanced(&mut self, values: AdvancedValues) {
+        let mut notes = Vec::new();
+        let mut restart = false;
+        if values.bitrate != self.profile.bitrate {
+            self.profile.bitrate = values.bitrate;
+            notes.push(format!("Stream bitrate: {}", describe_bitrate(self.bitrate_setting())));
+            if self.script_opt("mpvlink-kbps").is_some() {
+                notes.push("(--script-opts overrides the saved bitrate)".into());
+            } else {
+                restart = true;
+            }
+        }
+        if values.stun != self.profile.stun {
+            self.profile.stun = values.stun;
+            let ice = self.settings().1;
+            notes.push(format!("STUN server: {}", ice.first().map_or("none", String::as_str)));
+            if self.script_opt("mpvlink-stun").is_some() {
+                notes.push("(--script-opts overrides the saved STUN server)".into());
+            } else if let Some(session) = &self.session {
+                notes.push(format!("Applies the next time you join (still in room {}).", session.room()));
+            }
+        }
+        if notes.is_empty() {
+            return;
+        }
+        self.save_profile();
+        self.osd(&notes.join("\n"), 5000);
+        if restart {
+            // Restarts our stream, if we're streaming.
+            self.on_file_loaded();
+        }
+    }
+
+    /// The bitrate to stream at: --script-opts, else the saved setting, else
+    /// the default.
+    fn bitrate_setting(&self) -> Bitrate {
+        let parse = |text: &str, from: &str| match Bitrate::parse(text) {
+            Ok(b) => Some(b),
+            Err(problem) => {
+                eprintln!("[mpvlink] ignoring the {from} bitrate {text:?}: {problem}");
+                None
+            }
+        };
+        self.script_opt("mpvlink-kbps")
+            .and_then(|k| parse(&k, "--script-opts"))
+            .or_else(|| (!self.profile.bitrate.is_empty()).then(|| parse(&self.profile.bitrate, "saved")).flatten())
+            .unwrap_or_default()
     }
 
     /// Persist the settings ("" = default) and say what changed and where it applies.
@@ -640,7 +718,7 @@ impl Plugin {
             audio,
             subtitles,
             ffmpeg: self.ffmpeg_setting(),
-            kbps: self.script_opt("mpvlink-kbps").and_then(|k| k.parse().ok()).unwrap_or(DEFAULT_KBPS),
+            bitrate: self.bitrate_setting(),
             clock: Arc::new(move || remote.get_f64("time-pos")),
             seeks: self.seeks.clone(),
         });
@@ -769,14 +847,15 @@ impl Plugin {
         opts.split(',').find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v.to_string()))
     }
 
-    /// (signaling server URL, ICE server URLs). The server comes from
+    /// (signaling server URL, ICE server URLs). Each comes from
     /// --script-opts, else the saved setting, else the default.
     fn settings(&self) -> (String, Vec<String>) {
         let server = self
             .script_opt("mpvlink-server")
             .or_else(|| (!self.profile.server.is_empty()).then(|| self.profile.server.clone()))
             .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-        let ice = match self.script_opt("mpvlink-stun").as_deref() {
+        let stun = self.script_opt("mpvlink-stun").or_else(|| (!self.profile.stun.is_empty()).then(|| self.profile.stun.clone()));
+        let ice = match stun.as_deref() {
             Some("no" | "") => vec![],
             Some(url) => vec![url.to_string()],
             None => vec![mpvlink_rtc::peer::DEFAULT_STUN_SERVER.to_string()],
@@ -844,6 +923,8 @@ impl Plugin {
                 "next-field" => menu.focus_next(),
                 "prev-field" => menu.focus_prev(),
                 "submit" => menu.submit(),
+                "left" => menu.arrow(-1),
+                "right" => menu.arrow(1),
                 "close" => menu.escape(),
                 "paste" => menu.insert(clipboard.as_deref().unwrap_or("")),
                 "click" => mouse.map_or(Action::None, |pos| menu.click(pos, &layout)),
@@ -954,6 +1035,15 @@ impl Plugin {
     }
 }
 
+/// A bitrate setting in words, for messages.
+fn describe_bitrate(b: Bitrate) -> String {
+    match b {
+        Bitrate::Kbps(k) => format!("{k} kb/s"),
+        Bitrate::SOURCE => "the source video's".into(),
+        Bitrate::Times(t) => format!("{}× the source video's", bitrate::trim_number(t)),
+    }
+}
+
 // mpv requires this exact safe-looking C signature, so allow the raw pointer argument.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
@@ -967,3 +1057,4 @@ pub extern "C" fn mpv_open_cplugin(ctx: *mut ffi::mpv_handle) -> c_int {
     Plugin::new(mpv).run();
     0
 }
+

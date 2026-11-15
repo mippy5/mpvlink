@@ -38,8 +38,24 @@ script-opts-append=mpvlink-ffmpeg=/path/to/ffmpeg
 ```
 
 Hardware encoding is used when available (VideoToolbox on macOS; NVENC or
-Quick Sync on Windows/Linux), else x264. The stream is at most 1080p, at
-6000 kbit/s by default (`script-opts-append=mpvlink-kbps=4000` to change).
+Quick Sync on Windows/Linux), else x264. The stream is at most 1080p.
+
+The video bitrate is 6000 kbit/s by default. To change it, open **Settings**,
+then **Advanced**, and pick one of these:
+
+- **Match source:** the bitrate of the video you play. A video larger than
+  1080p is sent at 1080p, so its bitrate is scaled down to match (e.g. a 4K
+  file at 40 Mbit/s streams at 10). Results are kept between 500 and 50,000
+  kbit/s.
+- **× Source:** the source's bitrate times a number, e.g. 1.5. Values above
+  1 make up for H.264 needing more bits than HEVC or AV1 for the same
+  quality.
+- **Custom:** a fixed bitrate in kbit/s.
+
+A new bitrate applies to your stream right away. The source's bitrate comes
+from the file (the video stream's own figure, else the whole file's); if
+ffmpeg can't tell, the default is used. In `mpv.conf` the same choices are
+`script-opts-append=mpvlink-kbps=4000`, `=source` or `=1.5x`.
 Audio is Opus at 128 kbit/s stereo; it needs an ffmpeg with libopus (most
 builds have it), otherwise only video is streamed.
 

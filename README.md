@@ -72,14 +72,15 @@ For your own `input.conf`: `script-binding mpvlink/toggle-menu` and
 
 ### Options
 
-Settings saved in the Settings page can be overridden with `--script-opts`
-(or `script-opts-append=` in `mpv.conf`):
+Each of these can also be set in the menu (**Settings**, and its **Advanced**
+page). `--script-opts` (or `script-opts-append=` in `mpv.conf`) overrides
+what's saved there:
 
 | Option | Meaning |
 |---|---|
-| `mpvlink-server=wss://host` | Signaling server (default: saved setting, else `ws://127.0.0.1:8787`) |
-| `mpvlink-ffmpeg=/path/to/ffmpeg` | ffmpeg for streaming (default: saved setting, else found automatically) |
-| `mpvlink-kbps=6000` | Bitrate of your stream |
+| `mpvlink-server=wss://host` | Signaling server (default: `ws://127.0.0.1:8787`) |
+| `mpvlink-ffmpeg=/path/to/ffmpeg` | ffmpeg for streaming (default: found automatically) |
+| `mpvlink-kbps=6000` | Bitrate of your stream: kbit/s, `source` (match the video) or e.g. `1.5x` (times the video's); default 6000 |
 | `mpvlink-stun=stun:host:port` | STUN server, or `no` for none (default: Google's public one) |
 
 ## Limitations

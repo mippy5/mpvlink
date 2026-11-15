@@ -7,6 +7,7 @@
 //! changes and encoder delay are all handled by the same rule. Seeks restart
 //! ffmpeg at the new position.
 
+use crate::bitrate::{self, Bitrate};
 use crate::mpegts::{Kind, TsDemuxer, TsFrame, opus_samples};
 use crate::substyle::{AssHeader, SubStyle};
 use mpvlink_rtc::h264::is_keyframe;
@@ -109,7 +110,7 @@ pub struct StreamSource {
     pub subtitles: Option<BurnIn>,
     /// The ffmpeg executable.
     pub ffmpeg: String,
-    pub kbps: u32,
+    pub bitrate: Bitrate,
     pub clock: Clock,
     /// Bumped by the plugin each time mpv finishes a seek.
     pub seeks: Arc<AtomicU64>,
@@ -118,7 +119,7 @@ pub struct StreamSource {
 #[derive(Debug)]
 pub enum PipelineEvent {
     /// Encoding works; `encoder` is the one in use.
-    Started { encoder: String },
+    Started { encoder: String, kbps: u32 },
     /// This ffmpeg can't draw text subtitles (no libass): they're left out
     /// of the video, so viewers need them as text instead.
     TextSubtitlesUnsupported,
@@ -187,17 +188,19 @@ struct Runner {
     events: tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
     stop: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
-    /// What ffmpeg's subtitle drawing needs besides the source.
+    /// Worked out once per stream: the bitrate and what drawing subtitles needs.
     extras: Extras,
 }
 
-/// Prepared once per stream for drawing text subtitles.
+/// Prepared once per stream, before ffmpeg first runs.
 #[derive(Default)]
 struct Extras {
     /// The streamed file's attached fonts, for subtitles from another file.
     fonts: Option<FontsDir>,
     /// libass style overrides: mpv's subtitle style options.
     force_style: String,
+    /// The video bitrate, kb/s.
+    kbps: u32,
 }
 
 impl Runner {
@@ -228,6 +231,10 @@ impl Runner {
                         style.plain_text(*aspect)
                     };
                 }
+                self.extras.kbps = match self.source.bitrate {
+                    Bitrate::Kbps(k) => k,
+                    b => b.kbps(probe_source(&self.source.ffmpeg, &self.source.path, self.source.video_stream)),
+                };
                 found.video
             }
             Ok(_) => return self.fail("This ffmpeg has no H.264 encoder.".into()),
@@ -447,7 +454,7 @@ impl Runner {
     ) {
         if !*announced {
             *announced = true;
-            let _ = self.events.send(PipelineEvent::Started { encoder: encoder.to_string() });
+            let _ = self.events.send(PipelineEvent::Started { encoder: encoder.to_string(), kbps: self.extras.kbps });
         }
         let base = *base.get_or_insert(frame.pts);
         let file_time = start + (frame.pts - base) as f64 / 90_000.0;
@@ -590,7 +597,7 @@ fn ffmpeg_command(source: &StreamSource, start: f64, encoder: &str, extras: &Ext
         None => c.arg("-an"),
     };
     c.args(["-sn", "-dn"]);
-    let kbps = source.kbps;
+    let kbps = extras.kbps;
     let (rate, buffer) = (format!("{kbps}k"), format!("{}k", kbps / 2));
     c.args(["-c:v", encoder]);
     match encoder {
@@ -680,6 +687,19 @@ fn available_encoders(ffmpeg: &str) -> std::io::Result<Encoders> {
 
 /// The header of an ASS subtitle stream (styles, canvas size): the
 /// `index`th subtitle stream of `file`. Only the header is read.
+/// The bitrate and size of the video in `file`, from what `ffmpeg -i` says.
+fn probe_source(ffmpeg: &str, file: &str, stream: Option<i64>) -> Option<bitrate::SourceVideo> {
+    let mut c = Command::new(ffmpeg);
+    c.args(["-hide_banner", "-nostdin", "-i", file]).stdin(Stdio::null()).stdout(Stdio::null());
+    hide_console_window(&mut c);
+    let out = c.output().ok()?;
+    let found = bitrate::probe_source(&String::from_utf8_lossy(&out.stderr), stream);
+    if found.is_none() {
+        eprintln!("[mpvlink] couldn't tell the source's bitrate; streaming at the default");
+    }
+    found
+}
+
 fn ass_header(ffmpeg: &str, file: &str, index: usize) -> Option<String> {
     let mut c = Command::new(ffmpeg);
     c.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i", file])
@@ -767,14 +787,14 @@ mod tests {
             audio: AudioChoice::Off,
             subtitles,
             ffmpeg: "ffmpeg".into(),
-            kbps: 1000,
+            bitrate: Bitrate::Kbps(1000),
             clock: Arc::new(|| None),
             seeks: Arc::default(),
         }
     }
 
     fn args(source: &StreamSource, start: f64) -> Vec<String> {
-        ffmpeg_command(source, start, "libx264", &Extras::default()).get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+        ffmpeg_command(source, start, "libx264", &Extras { kbps: 1000, ..Extras::default() }).get_args().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
     fn graph(args: &[String]) -> &str {
@@ -837,7 +857,7 @@ mod tests {
     #[test]
     fn text_style_overrides_are_escaped() {
         let text = BurnIn::Text { file: None, index: 0, shift: 0.0, ass: false, aspect: 1.0, style: SubStyle::default() };
-        let extras = Extras { fonts: None, force_style: "FontName=Foo: Bar,MarginV=3".into() };
+        let extras = Extras { fonts: None, force_style: "FontName=Foo: Bar,MarginV=3".into(), kbps: 1000 };
         let args: Vec<String> = ffmpeg_command(&source(Some(text)), 0.0, "libx264", &extras)
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
