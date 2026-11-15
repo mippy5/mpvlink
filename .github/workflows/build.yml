@@ -1,0 +1,121 @@
+# Builds the mpv plugin for each platform and the signaling server for Linux.
+#
+# Every push and pull request: tests, then builds, uploaded as workflow
+# artifacts (on the run's page, under "Artifacts").
+# Pushing a tag like v0.2.0: the same, plus a GitHub release with the builds.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Tests and lints once (the code is the same everywhere), then the Linux
+  # builds. Built on Ubuntu 22.04, so they need glibc 2.35 or newer (Ubuntu
+  # 22.04+, Debian 12+), as docs/deploy.md assumes.
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build plugin and signaling server
+        run: |
+          make linux PKG=mpvlink
+          make linux PKG=mpvlink-signal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpvlink-linux-x86_64
+          path: dist/linux-x86_64/mpvlink.so
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpvlink-signal-linux-x86_64
+          path: dist/linux-x86_64/mpvlink-signal
+          if-no-files-found: error
+
+  # Cross-compiled with MinGW, like `make windows` on a Mac.
+  windows:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: Build plugin
+        run: make windows PKG=mpvlink
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpvlink-windows-x86_64
+          path: dist/windows-x86_64/mpvlink.dll
+          if-no-files-found: error
+
+  # One universal file for Apple Silicon and Intel Macs.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build plugin (universal)
+        run: |
+          cargo build --release -p mpvlink --target aarch64-apple-darwin
+          cargo build --release -p mpvlink --target x86_64-apple-darwin
+          mkdir -p dist/macos-universal
+          # mpv only loads plugins named .so, even on macOS.
+          lipo -create -output dist/macos-universal/mpvlink.so \
+            target/aarch64-apple-darwin/release/libmpvlink.dylib \
+            target/x86_64-apple-darwin/release/libmpvlink.dylib
+          # Apple Silicon refuses unsigned code; an ad-hoc signature is enough.
+          codesign --force --sign - dist/macos-universal/mpvlink.so
+          lipo -info dist/macos-universal/mpvlink.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpvlink-macos-universal
+          path: dist/macos-universal/mpvlink.so
+          if-no-files-found: error
+
+  # On a version tag: a GitHub release with every build attached.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Package
+        run: |
+          mkdir release
+          cd artifacts
+          # Plugins keep the file name mpv expects (mpvlink.so / mpvlink.dll),
+          # so each goes in its own archive named after the platform.
+          for dir in mpvlink-linux-x86_64 mpvlink-macos-universal mpvlink-signal-linux-x86_64; do
+            chmod +x "$dir"/* 2>/dev/null || true
+            tar -czf "../release/$dir.tar.gz" -C "$dir" .
+          done
+          (cd mpvlink-windows-x86_64 && zip -q "../../release/mpvlink-windows-x86_64.zip" mpvlink.dll)
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --generate-notes
