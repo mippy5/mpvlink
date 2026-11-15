@@ -801,8 +801,14 @@ impl Plugin {
         let name = args.get(1).map(String::as_str).unwrap_or("");
         let state = args.get(2).map(String::as_str).unwrap_or("");
         // d = down, r = repeat, p = press (when up/down can't be tracked); ignore u = up.
-        if !matches!(state.chars().next(), Some('d' | 'r' | 'p')) {
-            return;
+        // mpv auto-repeats every script-binding regardless of the "repeatable"
+        // flag, so only typing and backspace may act on repeats; otherwise a
+        // held Ctrl+j toggles the menu over and over and Ctrl+v pastes many times.
+        let repeatable = matches!(name, "text" | "backspace");
+        match state.chars().next() {
+            Some('d' | 'p') => {}
+            Some('r') if repeatable => {}
+            _ => return,
         }
 
         match name {

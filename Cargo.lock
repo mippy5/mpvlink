@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "mpvlink"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "mpvlink-proto"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "mpvlink-rtc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "mpvlink-send"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "mpvlink-rtc",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "mpvlink-signal"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "futures-util",
