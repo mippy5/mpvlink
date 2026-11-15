@@ -3,6 +3,7 @@ name = "mpvlink-signal"
 description = "mpvlink signaling server: matches peers by room code and relays SDP"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 mpvlink-proto.workspace = true

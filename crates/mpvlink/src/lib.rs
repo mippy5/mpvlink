@@ -100,6 +100,23 @@ const LOW_LATENCY_OPTIONS: &[&str] = &[
     "audio-buffer=0.1",
 ];
 
+/// Clipboard fallback for mpv builds that can't write `clipboard/text`.
+#[cfg(target_os = "macos")]
+fn copy_with_pbcopy(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() else {
+        return false;
+    };
+    let wrote = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+    child.wait().is_ok_and(|status| status.success()) && wrote
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_with_pbcopy(_text: &str) -> bool {
+    false
+}
+
 struct Plugin {
     mpv: Mpv,
     menu: Option<Menu>,
@@ -464,20 +481,7 @@ impl Plugin {
     /// clipboard/text is Windows-only, but it works on macOS too; pbcopy is a
     /// fallback for builds where it doesn't. (No Linux fallback yet.)
     fn copy_to_clipboard(&self, text: &str) -> bool {
-        if self.mpv.set_string("clipboard/text", text).is_ok() {
-            return true;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use std::io::Write;
-            use std::process::{Command, Stdio};
-            let child = Command::new("pbcopy").stdin(Stdio::piped()).spawn();
-            if let Ok(mut child) = child {
-                let wrote = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
-                return child.wait().is_ok_and(|status| status.success()) && wrote;
-            }
-        }
-        false
+        self.mpv.set_string("clipboard/text", text).is_ok() || copy_with_pbcopy(text)
     }
 
     fn join_room(&mut self, name: &str, code: &str) {

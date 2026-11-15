@@ -121,3 +121,7 @@ make windows                # dist/windows-x86_64/ (see docs/windows.md)
 Pushing to GitHub runs [.github/workflows/build.yml](.github/workflows/build.yml),
 which builds the plugin for every platform and the server for Linux; pushing a
 `v*` tag also publishes a release.
+
+## License
+
+[MIT](LICENSE)

@@ -3,6 +3,7 @@ name = "mpvlink"
 description = "mpv plugin: join low-latency WebRTC rooms"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [lib]
 # Build a C-ABI shared library (.dylib / .so / .dll) that mpv can load as a cplugin.

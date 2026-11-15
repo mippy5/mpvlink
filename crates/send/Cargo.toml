@@ -3,6 +3,7 @@ name = "mpvlink-send"
 description = "Test streamer: streams an H.264 test pattern into an mpvlink room"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 mpvlink-rtc.workspace = true
