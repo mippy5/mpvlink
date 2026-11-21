@@ -8,8 +8,12 @@
 //! demuxer pulls bytes out through the stream callbacks below, as if reading
 //! a raw .h264 file that never ends.
 //!
+//! Each frame has a time to be shown (see [`crate::jitter`]): mpv can't read
+//! a frame before then, which evens out uneven arrival. With smoothing off,
+//! that's the moment it arrives.
+//!
 //! Latency matters more than completeness here: the queue holds at most a few
-//! frames. If mpv falls behind (or isn't reading, e.g. paused), the backlog is
+//! frames that are due. If mpv falls behind (or isn't reading, e.g. paused), the backlog is
 //! thrown away and the queue waits for the next keyframe, so playback resumes
 //! at "now" instead of drifting further behind.
 
@@ -24,18 +28,94 @@ use std::time::{Duration, Instant};
 
 pub const PROTOCOL: &str = "mpvlink";
 
-/// About a quarter second at 30 fps. Beyond this, the reader is behind.
+/// About a quarter second at 30 fps. Beyond this many due frames, the reader
+/// is behind.
 const MAX_QUEUED_FRAMES: usize = 8;
+/// A backstop for frames held back for smoothing (over a second at 60 fps).
+const MAX_HELD_FRAMES: usize = 80;
+
+/// How the video reaches mpv.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoFormat {
+    /// Raw H.264 (Annex B): no timestamps; frames show as they arrive.
+    #[default]
+    Raw,
+    /// Matroska with timestamps, so subtitle tracks can be timed to the
+    /// stream (see [`FrameQueue::subtitle_offset`]).
+    ///
+    /// The timestamps follow real time (when each frame is due), not the
+    /// file: they never jump (a seek, pause or speed change on the streamer's
+    /// side would make mpv wait or rush), and since the first frames are
+    /// stamped close together, every later frame is "late" to mpv and shows
+    /// at once, as raw H.264 does. How far that timeline is from the file's
+    /// is the subtitle offset.
+    Matroska,
+}
+
+/// Matroska: how many frames start the stream stamped 1 ms apart, putting
+/// mpv's clock that far behind (about a second) so later frames show the
+/// moment they arrive.
+const HEAD_START_FRAMES: u32 = 25;
+
+/// A frame waiting to be read.
+struct Queued {
+    data: Bytes,
+    keyframe: bool,
+    /// When it may be read.
+    show: Instant,
+    /// Its position in the streamed file, seconds (if the sender says).
+    position: Option<f64>,
+}
 
 #[derive(Default)]
 struct Inner {
-    frames: VecDeque<Bytes>,
-    /// How much of the front frame the reader has consumed.
+    frames: VecDeque<Queued>,
+    /// The frame being read, as bytes for mpv, and how much is read.
+    out: Vec<u8>,
     offset: usize,
+    format: VideoFormat,
+    /// Matroska: the header went out (it needs the first keyframe's
+    /// parameter sets); the timeline so far (ms) and when the last frame
+    /// was due; frames stamped so far.
+    header_sent: bool,
+    /// How far the timeline is from the file (stream - file, ms), as of the
+    /// latest frame handed to mpv.
+    offset_ms: Option<f64>,
+    stream_ms: f64,
+    last_show: Option<Instant>,
+    stamped: u32,
     /// No more data until `reset`; readers get EOF once drained.
     ended: bool,
     /// Discard frames until a keyframe (after dropping backlog).
     need_keyframe: bool,
+}
+
+impl Inner {
+    /// The bytes mpv gets for `frame`.
+    fn format(&mut self, frame: Queued) -> Vec<u8> {
+        if self.format == VideoFormat::Raw {
+            return frame.data.to_vec();
+        }
+        let mut out = Vec::new();
+        if !self.header_sent {
+            let find = |t: u8| mpvlink_rtc::h264::nal_units(&frame.data).find(|n| n[0] & 0x1F == t).map(<[u8]>::to_vec);
+            let (Some(sps), Some(pps)) = (find(7), find(8)) else { return out }; // can't start here
+            out.extend(webm::video_header(&sps, &pps));
+            self.header_sent = true;
+        }
+        // Real time since the last frame was due (1 ms during the head start).
+        if let Some(last) = self.last_show {
+            let gap = frame.show.saturating_duration_since(last).as_secs_f64() * 1000.0;
+            self.stream_ms += if self.stamped < HEAD_START_FRAMES { 1.0 } else { gap.max(1.0) };
+        }
+        self.last_show = Some(frame.show);
+        self.stamped += 1;
+        out.extend(webm::video_cluster(self.stream_ms.round() as u64, frame.keyframe, &frame.data));
+        if let Some(position) = frame.position {
+            self.offset_ms = Some(self.stream_ms - position * 1000.0);
+        }
+        out
+    }
 }
 
 #[derive(Default)]
@@ -49,23 +129,33 @@ impl FrameQueue {
         Arc::new(Self { inner: Mutex::new(Inner { need_keyframe: true, ..Default::default() }), ..Default::default() })
     }
 
-    /// Queue a complete frame. Returns true if the queue is waiting for a
+    /// Queue a complete frame, to be read from `show` on; `position`: where
+    /// it is in the streamed file. Returns true if the queue is waiting for a
     /// keyframe, in which case the caller should ask the sender for one.
-    pub fn push(&self, frame: Bytes, keyframe: bool) -> bool {
+    pub fn push(&self, frame: Bytes, keyframe: bool, show: Instant, position: Option<f64>) -> bool {
         let mut q = self.inner.lock().unwrap();
-        if q.frames.len() >= MAX_QUEUED_FRAMES {
-            // Keep a partially-read front frame so the byte stream stays intact.
-            let keep = usize::from(q.offset > 0);
-            q.frames.truncate(keep);
+        let now = Instant::now();
+        let due = q.frames.iter().take_while(|f| f.show <= now).count();
+        if due >= MAX_QUEUED_FRAMES || q.frames.len() >= MAX_HELD_FRAMES {
+            // (A frame partly read is in `out`, so the byte stream stays intact.)
+            q.frames.clear();
             q.need_keyframe = true;
         }
         if q.need_keyframe && !keyframe {
             return true;
         }
         q.need_keyframe = false;
-        q.frames.push_back(frame);
+        q.frames.push_back(Queued { data: frame, keyframe, show, position });
         self.readable.notify_all();
         false
+    }
+
+    /// Matroska: how far the stream's timeline is from the streamed file's,
+    /// in seconds (stream minus file), as of the latest frame: what mpv's
+    /// `sub-delay` must be for subtitle tracks of the file to line up.
+    pub fn subtitle_offset(&self) -> Option<f64> {
+        let q = self.inner.lock().unwrap();
+        (q.format == VideoFormat::Matroska).then_some(q.offset_ms?).map(|ms| ms / 1000.0)
     }
 
     /// Signal end of stream: readers get EOF after the remaining frames.
@@ -74,37 +164,48 @@ impl FrameQueue {
         self.readable.notify_all();
     }
 
-    /// Start a fresh stream (e.g. a new publisher): clear everything.
+    /// Start a fresh stream (e.g. a new publisher): clear everything (but
+    /// keep the reader's format).
     pub fn reset(&self) {
-        *self.inner.lock().unwrap() = Inner { need_keyframe: true, ..Default::default() };
+        let mut q = self.inner.lock().unwrap();
+        let format = q.format;
+        *q = Inner { need_keyframe: true, format, ..Default::default() };
     }
 
-    /// A new reader starts at "now": drop the backlog, resume at a keyframe.
-    fn attach_reader(&self) {
+    /// A new reader starts at "now", in `format`: drop the backlog, resume
+    /// at a keyframe.
+    fn attach_reader(&self, format: VideoFormat) {
         let mut q = self.inner.lock().unwrap();
-        q.frames.clear();
-        q.offset = 0;
-        q.need_keyframe = true;
+        *q = Inner { need_keyframe: true, format, ..Default::default() };
     }
 
     /// Blocking read for mpv. Returns bytes read, 0 at EOF, -1 if cancelled.
     fn read(&self, buf: &mut [u8], cancelled: &AtomicBool) -> i64 {
+        // This (mpv's) thread waits for frames' times.
+        crate::jitter::timing_critical();
         let mut q = self.inner.lock().unwrap();
         loop {
             if cancelled.load(Ordering::Relaxed) {
                 return -1;
             }
-            let offset = q.offset;
-            if let Some(front) = q.frames.front() {
-                let n = buf.len().min(front.len() - offset);
-                buf[..n].copy_from_slice(&front[offset..offset + n]);
-                if offset + n == front.len() {
-                    q.frames.pop_front();
-                    q.offset = 0;
-                } else {
-                    q.offset += n;
-                }
+            // The rest of the frame being read.
+            if q.offset < q.out.len() {
+                let offset = q.offset;
+                let n = buf.len().min(q.out.len() - offset);
+                buf[..n].copy_from_slice(&q.out[offset..offset + n]);
+                q.offset += n;
                 return n as i64;
+            }
+            // The next frame, once it's due.
+            let early = q.frames.front().map(|f| f.show.saturating_duration_since(Instant::now()));
+            if let Some(early) = early.filter(|e| !e.is_zero()) {
+                q = self.readable.wait_timeout(q, early).unwrap().0;
+                continue;
+            }
+            if let Some(frame) = q.frames.pop_front() {
+                q.out = q.format(frame);
+                q.offset = 0;
+                continue;
             }
             if q.ended {
                 return 0;
@@ -138,8 +239,9 @@ const SILENCE_SAMPLES: u32 = 960;
 
 #[derive(Default)]
 struct AudioInner {
-    /// Opus packets not yet handed to the reader, with their sample counts.
-    packets: VecDeque<(Bytes, u32)>,
+    /// Opus packets not yet handed to the reader, with their sample counts
+    /// and when they may be (held back as long as video is, for lip sync).
+    packets: VecDeque<(Bytes, u32, Instant)>,
     /// WebM bytes being read (the header, then one cluster at a time).
     out: Vec<u8>,
     offset: usize,
@@ -185,17 +287,20 @@ impl AudioQueue {
         Arc::new(Self::default())
     }
 
-    /// Queue an Opus packet.
-    pub fn push(&self, packet: Bytes) {
+    /// Queue an Opus packet, to be played from `play` on.
+    pub fn push(&self, packet: Bytes, play: Instant) {
         let samples = mpegts::opus_samples(&packet).unwrap_or(960);
         let mut q = self.inner.lock().unwrap();
-        q.last_packet = Some(Instant::now());
+        let now = Instant::now();
+        q.last_packet = Some(now);
         if !q.attached {
             return;
         }
-        q.packets.push_back((packet, samples));
+        q.packets.push_back((packet, samples, play));
+        // Only audio that's due counts as backlog.
         let limit = MAX_QUEUED_AUDIO_MS * (OPUS_RATE / 1000);
-        while q.packets.iter().map(|(_, n)| n).sum::<u32>() > limit {
+        let due = |q: &AudioInner| q.packets.iter().take_while(|p| p.2 <= now).map(|p| p.1).sum::<u32>();
+        while due(&q) > limit {
             q.packets.pop_front();
         }
         self.readable.notify_all();
@@ -237,6 +342,7 @@ impl AudioQueue {
 
     /// Blocking read for mpv. Returns bytes read, 0 at EOF, -1 if cancelled.
     fn read(&self, buf: &mut [u8], cancelled: &AtomicBool) -> i64 {
+        crate::jitter::timing_critical();
         let mut q = self.inner.lock().unwrap();
         loop {
             if cancelled.load(Ordering::Relaxed) {
@@ -248,10 +354,12 @@ impl AudioQueue {
                 q.offset += n;
                 return n as i64;
             }
-            if let Some((packet, samples)) = q.packets.pop_front() {
+            let now = Instant::now();
+            if let Some((packet, samples, _)) = q.packets.pop_front_if(|p| p.2 <= now) {
                 q.output(&packet, samples, false);
                 continue;
             }
+            let next = q.packets.front().map(|p| p.2.saturating_duration_since(now));
             if q.ended {
                 return 0;
             }
@@ -263,7 +371,8 @@ impl AudioQueue {
                 q.output(&OPUS_SILENCE, SILENCE_SAMPLES, true);
                 continue;
             }
-            q = self.readable.wait_timeout(q, due - quiet_for).unwrap().0;
+            let wait = (due - quiet_for).min(next.unwrap_or(Duration::MAX));
+            q = self.readable.wait_timeout(q, wait).unwrap().0;
         }
     }
 
@@ -298,6 +407,16 @@ pub fn audio_url(room: &str, peer: u64) -> String {
     format!("{}/audio", url(room, peer))
 }
 
+/// The video as Matroska, with timestamps (see [`VideoFormat::Matroska`]).
+pub fn matroska_url(room: &str, peer: u64) -> String {
+    format!("{}/mkv", url(room, peer))
+}
+
+/// The subtitle offset of `room`'s stream (see [`FrameQueue::subtitle_offset`]).
+pub fn subtitle_offset(room: &str) -> Option<f64> {
+    routes().lock().unwrap().get(room).and_then(|(video, _)| video.subtitle_offset())
+}
+
 // ---- mpv stream callbacks ---------------------------------------------------
 //
 // mpv calls these from its demuxer thread (cancel from another thread). The
@@ -320,7 +439,9 @@ pub unsafe extern "C" fn open(_user_data: *mut c_void, uri: *mut c_char, info: *
     let rest = uri.trim_start_matches(PROTOCOL).trim_start_matches("://");
     let mut parts = rest.split('/');
     let room = parts.next().unwrap_or_default();
-    let audio = parts.nth(1) == Some("audio");
+    let kind = parts.nth(1);
+    let audio = kind == Some("audio");
+    let matroska = kind == Some("mkv");
     let Some((video_queue, audio_queue)) = routes().lock().unwrap().get(room).cloned() else {
         return MPV_ERROR_LOADING_FAILED;
     };
@@ -328,7 +449,8 @@ pub unsafe extern "C" fn open(_user_data: *mut c_void, uri: *mut c_char, info: *
         audio_queue.attach_reader();
         Source::Audio(audio_queue)
     } else {
-        video_queue.attach_reader();
+        let format = if matroska { VideoFormat::Matroska } else { VideoFormat::Raw };
+        video_queue.attach_reader(format);
         Source::Video(video_queue)
     };
     let reader = Box::new(Reader { source, cancelled: AtomicBool::new(false) });
@@ -383,37 +505,52 @@ mod tests {
     #[test]
     fn starts_at_a_keyframe_and_reads_in_order() {
         let q = FrameQueue::new();
-        assert!(q.push(Bytes::from_static(b"p0"), false), "needs a keyframe first");
-        assert!(!q.push(Bytes::from_static(b"KEY1"), true));
-        assert!(!q.push(Bytes::from_static(b"p2"), false));
+        assert!(q.push(Bytes::from_static(b"p0"), false, Instant::now(), None), "needs a keyframe first");
+        assert!(!q.push(Bytes::from_static(b"KEY1"), true, Instant::now(), None));
+        assert!(!q.push(Bytes::from_static(b"p2"), false, Instant::now(), None));
         assert_eq!(read_all(&q), b"KEY1p2");
     }
 
     #[test]
     fn overflow_drops_backlog_and_waits_for_keyframe() {
         let q = FrameQueue::new();
-        q.push(Bytes::from_static(b"K"), true);
+        q.push(Bytes::from_static(b"K"), true, Instant::now(), None);
         for _ in 1..MAX_QUEUED_FRAMES {
-            q.push(Bytes::from_static(b"p"), false);
+            q.push(Bytes::from_static(b"p"), false, Instant::now(), None);
         }
-        assert!(q.push(Bytes::from_static(b"x"), false), "overflow -> keyframe wanted");
-        assert!(q.push(Bytes::from_static(b"y"), false));
-        assert!(!q.push(Bytes::from_static(b"K2"), true));
+        assert!(q.push(Bytes::from_static(b"x"), false, Instant::now(), None), "overflow -> keyframe wanted");
+        assert!(q.push(Bytes::from_static(b"y"), false, Instant::now(), None));
+        assert!(!q.push(Bytes::from_static(b"K2"), true, Instant::now(), None));
         assert_eq!(read_all(&q), b"K2");
     }
 
     #[test]
     fn overflow_keeps_partially_read_frame() {
         let q = FrameQueue::new();
-        q.push(Bytes::from_static(b"KEYFRAME"), true);
+        q.push(Bytes::from_static(b"KEYFRAME"), true, Instant::now(), None);
         let never = AtomicBool::new(false);
         let mut buf = [0u8; 3];
         assert_eq!(q.read(&mut buf, &never), 3);
         for _ in 0..MAX_QUEUED_FRAMES {
-            q.push(Bytes::from_static(b"p"), false);
+            q.push(Bytes::from_static(b"p"), false, Instant::now(), None);
         }
-        q.push(Bytes::from_static(b"K2"), true);
+        q.push(Bytes::from_static(b"K2"), true, Instant::now(), None);
         assert_eq!(read_all(&q), b"FRAMEK2");
+    }
+
+    #[test]
+    fn frames_wait_until_due_and_held_ones_dont_overflow() {
+        let q = FrameQueue::new();
+        let start = Instant::now();
+        let later = start + Duration::from_millis(60);
+        q.push(Bytes::from_static(b"K"), true, later, None);
+        // Held frames don't count as backlog.
+        for _ in 0..MAX_QUEUED_FRAMES {
+            assert!(!q.push(Bytes::from_static(b"p"), false, later, None));
+        }
+        let never = AtomicBool::new(false);
+        assert_eq!(q.read(&mut [0u8; 4], &never), 1);
+        assert!(start.elapsed() >= Duration::from_millis(60), "read waited for the frame's time");
     }
 
     #[test]
@@ -443,11 +580,11 @@ mod tests {
     #[test]
     fn audio_starts_with_header_and_has_continuous_timestamps() {
         let q = AudioQueue::new();
-        q.push(Bytes::from_static(&[0xFC, 0]));
+        q.push(Bytes::from_static(&[0xFC, 0]), Instant::now());
         assert!(q.active());
         q.attach_reader(); // packets before a reader are dropped
         for i in 0..3u8 {
-            q.push(Bytes::from(vec![0xFC, i])); // 20 ms each
+            q.push(Bytes::from(vec![0xFC, i]), Instant::now()); // 20 ms each
         }
         let bytes = read_audio(&q);
         let mut expected = webm::header();
@@ -462,7 +599,7 @@ mod tests {
         let q = AudioQueue::new();
         q.attach_reader();
         for i in 0..20u8 {
-            q.push(Bytes::from(vec![0xFC, i])); // 400 ms in all
+            q.push(Bytes::from(vec![0xFC, i]), Instant::now()); // 400 ms in all
         }
         let bytes = read_audio(&q);
         let mut expected = webm::header();
@@ -471,6 +608,21 @@ mod tests {
             expected.extend(webm::cluster(n as u64 * 20, &[0xFC, i]));
         }
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn audio_waits_until_its_time() {
+        let q = AudioQueue::new();
+        q.attach_reader();
+        let never = AtomicBool::new(false);
+        let mut buf = [0u8; 4096];
+        q.read(&mut buf, &never); // the header
+        let start = Instant::now();
+        // Held back 40 ms (less than the wait before silence fills in).
+        q.push(Bytes::from_static(&[0xFC, 9]), start + Duration::from_millis(40));
+        let n = q.read(&mut buf, &never);
+        assert!(start.elapsed() >= Duration::from_millis(40), "waited for its time");
+        assert!(buf[..n as usize].ends_with(&[0xFC, 9]), "the packet, not silence");
     }
 
     #[test]
@@ -487,7 +639,7 @@ mod tests {
         assert!(started.elapsed() >= SILENCE_AFTER);
         assert_eq!(&buf[..n], webm::cluster(0, &OPUS_SILENCE).as_slice());
         // Real audio afterwards continues the timeline.
-        q.push(Bytes::from_static(&[0xFC, 7]));
+        q.push(Bytes::from_static(&[0xFC, 7]), Instant::now());
         let n = q.read(&mut buf, &never) as usize;
         assert_eq!(&buf[..n], webm::cluster(20, &[0xFC, 7]).as_slice());
     }

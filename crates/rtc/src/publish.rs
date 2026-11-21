@@ -1,9 +1,12 @@
 //! The streaming side: one peer connection per viewer who asked to watch,
 //! all fed from the same stream of encoded video frames and audio packets.
 
-use crate::h264::normalize_start_codes;
+use crate::files;
+use webrtc::data_channel::{DataChannelEvent, RTCDataChannelState};
+use crate::h264::{insert_before_slices, normalize_start_codes, position_sei};
 use crate::peer::{self, ConnectionState, PeerEvent, h264_codec, new_peer_connection, opus_codec, random_ssrc};
 use crate::signaling::Signaling;
+use crate::stats::{LinkStats, link_stats};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use mpvlink_proto::{PeerId, Signal};
@@ -12,10 +15,10 @@ use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
@@ -46,6 +49,14 @@ impl Frame {
         Self { media: Media::Video, data, keyframe, duration }
     }
 
+    /// A video frame that's at `position` seconds in the streamed file
+    /// (receivers can read it with [`crate::h264::read_position`]).
+    pub fn video_at(annex_b: &[u8], keyframe: bool, duration: Duration, position: f64) -> Self {
+        let frame = Self::new(annex_b, keyframe, duration);
+        let data = insert_before_slices(&frame.data, &position_sei(position));
+        Self { data, ..frame }
+    }
+
     /// An Opus packet.
     pub fn audio(packet: &[u8], duration: Duration) -> Self {
         Self { media: Media::Audio, data: Bytes::copy_from_slice(packet), keyframe: true, duration }
@@ -62,13 +73,22 @@ pub type Log = Arc<dyn Fn(String) + Send + Sync>;
 const FRAME_BUFFER: usize = 48;
 
 struct Watcher {
+    name: String,
     task: JoinHandle<()>,
     answers: mpsc::UnboundedSender<String>,
+    /// The connection's latest stats and send rate in kb/s (None until connected).
+    stats: Arc<Mutex<Option<(LinkStats, f64)>>>,
 }
+
+/// How often each viewer's connection stats are read.
+const STATS_EVERY: Duration = Duration::from_secs(1);
 
 pub struct Publisher {
     signaling: Signaling,
     frames: broadcast::Sender<Frame>,
+    /// Files for viewers (subtitle tracks and fonts), sent over a data
+    /// channel; None: none.
+    pack: watch::Sender<Option<Arc<files::Pack>>>,
     keyframe_wanted: Arc<AtomicBool>,
     ice_servers: Vec<String>,
     /// Offer an audio track too.
@@ -82,9 +102,11 @@ impl Publisher {
     /// track; it's fine if no packets ever arrive on it).
     pub fn new(signaling: Signaling, ice_servers: Vec<String>, audio: bool, log: Log) -> Self {
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
+        let (pack, _) = watch::channel(None);
         Self {
             signaling,
             frames,
+            pack,
             keyframe_wanted: Arc::new(AtomicBool::new(true)),
             ice_servers,
             audio,
@@ -96,6 +118,12 @@ impl Publisher {
     /// Where to send encoded frames. Sending with nobody watching is fine.
     pub fn frames(&self) -> broadcast::Sender<Frame> {
         self.frames.clone()
+    }
+
+    /// Files every viewer should have (None: none). Sent to each viewer
+    /// once connected, and again whenever they change.
+    pub fn set_pack(&self, pack: Option<Arc<files::Pack>>) {
+        self.pack.send_replace(pack);
     }
 
     /// Set when a viewer needs a keyframe; an encoder that can produce one
@@ -125,7 +153,10 @@ impl Publisher {
     pub fn watch(&mut self, id: PeerId, name: &str) {
         self.unwatch(id);
         let (answers, answer_rx) = mpsc::unbounded_channel();
+        let stats = Arc::new(Mutex::new(None));
         let ctx = ViewerCtx {
+            pack: self.pack.subscribe(),
+            stats: stats.clone(),
             id,
             name: name.to_string(),
             signaling: self.signaling.clone(),
@@ -143,7 +174,7 @@ impl Publisher {
                 Err(e) => log(format!("{name} ({id}): {e:#}")),
             }
         });
-        self.watchers.insert(id, Watcher { task, answers });
+        self.watchers.insert(id, Watcher { name: name.to_string(), task, answers, stats });
     }
 
     /// Stop sending to `id` (they switched away or left).
@@ -156,6 +187,21 @@ impl Publisher {
     /// Everyone currently watching (or connecting).
     pub fn watchers(&self) -> Vec<PeerId> {
         self.watchers.keys().copied().collect()
+    }
+
+    /// Connection stats for each viewer that's connected: (id, name, stats,
+    /// kb/s being sent to them).
+    pub fn viewer_stats(&self) -> Vec<(PeerId, String, LinkStats, f64)> {
+        let mut out: Vec<_> = self
+            .watchers
+            .iter()
+            .filter_map(|(id, w)| {
+                let (stats, kbps) = w.stats.lock().unwrap().clone()?;
+                Some((*id, w.name.clone(), stats, kbps))
+            })
+            .collect();
+        out.sort_by_key(|(id, ..)| *id);
+        out
     }
 
     /// Stop sending to everyone.
@@ -172,8 +218,19 @@ impl Drop for Publisher {
     }
 }
 
+/// Stops a task when dropped (when the viewer's connection ends).
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 struct ViewerCtx {
     id: PeerId,
+    pack: watch::Receiver<Option<Arc<files::Pack>>>,
+    stats: Arc<Mutex<Option<(LinkStats, f64)>>>,
     name: String,
     signaling: Signaling,
     frames: broadcast::Sender<Frame>,
@@ -221,6 +278,8 @@ fn local_track(kind: RtpCodecKind, id: &str, codec: rtc::rtp_transceiver::rtp_se
 /// they leave or the connection fails.
 async fn serve_viewer(ctx: ViewerCtx, mut answers: mpsc::UnboundedReceiver<String>) -> Result<()> {
     let (pc, mut events) = new_peer_connection(&ctx.ice_servers).await?;
+    // Created before the offer, so the offer includes it.
+    let channel = pc.create_data_channel(files::LABEL, None).await?;
 
     let (video_track, video_ssrc) = local_track(RtpCodecKind::Video, "video", h264_codec())?;
     let video_sender = pc.add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal>).await?;
@@ -268,13 +327,50 @@ async fn serve_viewer(ctx: ViewerCtx, mut answers: mpsc::UnboundedReceiver<Strin
         None => None,
     };
 
+    // Files go on their own task: sending waits whenever the channel's
+    // buffer is full, and video mustn't.
+    let mut pack = ctx.pack.clone();
+    let files_task = tokio::spawn(async move {
+        // Wait until the viewer has the channel open.
+        while channel.ready_state().await.ok() != Some(RTCDataChannelState::Open) {
+            match channel.poll().await {
+                Some(DataChannelEvent::OnOpen) => break,
+                Some(DataChannelEvent::OnClose) | None => return,
+                Some(_) => {}
+            }
+        }
+        loop {
+            let current = pack.borrow_and_update().clone();
+            if let Err(e) = files::send(channel.as_ref(), current.as_deref()).await {
+                eprintln!("[mpvlink] sending files to a viewer: {e}");
+                return;
+            }
+            if pack.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+    let _abort_files = AbortOnDrop(files_task);
+
     // Start them on a keyframe; skip video frames until one comes. Audio
     // needs no such start, so it flows right away.
     let mut frames = ctx.frames.subscribe();
     ctx.keyframe_wanted.store(true, Ordering::Relaxed);
     let mut waiting_for_keyframe = true;
+    let mut stats_timer = tokio::time::interval(STATS_EVERY);
+    let mut last_sent: Option<(Instant, u64)> = None;
     loop {
         tokio::select! {
+            _ = stats_timer.tick() => {
+                let stats = link_stats(&pc).await;
+                let now = Instant::now();
+                let kbps = last_sent.map_or(0.0, |(then, bytes)| {
+                    let secs = now.duration_since(then).as_secs_f64().max(0.001);
+                    stats.bytes_sent.saturating_sub(bytes) as f64 * 8.0 / 1000.0 / secs
+                });
+                last_sent = Some((now, stats.bytes_sent));
+                *ctx.stats.lock().unwrap() = Some((stats, kbps));
+            }
             frame = frames.recv() => match frame {
                 Ok(frame) if frame.media == Media::Audio => {
                     if let Some(audio) = &audio {

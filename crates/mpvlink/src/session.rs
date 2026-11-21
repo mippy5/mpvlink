@@ -11,18 +11,23 @@
 
 use crate::ffmpeg::{BurnIn, Pipeline, PipelineEvent, StreamSource};
 use crate::stream::{self, AudioQueue, FrameQueue};
+use crate::jitter::{self, Playout};
+use crate::telemetry;
 use anyhow::{Context, Result, bail};
 use mpvlink_rtc::h264::{FrameAssembler, is_keyframe};
 use mpvlink_rtc::peer::{self, ConnectionState, PeerEvent, new_peer_connection};
-use mpvlink_rtc::proto::{PeerId, PeerInfo, ServerMsg, Signal};
+use mpvlink_rtc::proto::{AnimeEpisode, FEATURE_NOW_PLAYING, PeerId, PeerInfo, ServerMsg, Signal};
 use mpvlink_rtc::publish::Publisher;
 use mpvlink_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
 use mpvlink_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use mpvlink_rtc::rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
 use mpvlink_rtc::signaling::{JoinInfo, Signaling, SignalingEvent};
+use mpvlink_rtc::files;
+use mpvlink_rtc::stats::link_stats;
+use mpvlink_rtc::webrtc::data_channel::{DataChannel, DataChannelEvent};
 use mpvlink_rtc::webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use mpvlink_rtc::webrtc::peer_connection::PeerConnection;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -58,6 +63,23 @@ pub enum SessionEvent {
     Subtitle(String),
     /// Our own stream stopped because of an error.
     StreamingFailed(String),
+    /// What the stream we're watching is playing (for list tracking).
+    NowPlaying { file: String, duration_ms: u64, anime: Option<AnimeEpisode> },
+    /// The stream's playback position.
+    Position { position_ms: u64, paused: bool },
+    /// Streamer `peer` sent files (subtitle tracks and fonts), saved in
+    /// `dir`: each file's path and the streamer's description of it.
+    Files { peer: PeerId, dir: String, files: Vec<(String, serde_json::Value)> },
+    /// Streamer `peer` has no files for viewers now.
+    FilesCleared { peer: PeerId },
+}
+
+/// What our own stream is playing, as viewers are told.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NowPlaying {
+    pub file: String,
+    pub duration_ms: u64,
+    pub anime: Option<AnimeEpisode>,
 }
 
 /// Someone in the room, as far as the signaling server has told us.
@@ -143,9 +165,22 @@ enum Command {
     StartStreaming(Box<StreamSource>),
     StopStreaming,
     Subtitle(String),
+    NowPlaying(NowPlaying),
+    Position { position_ms: u64, paused: bool },
+    Files(Option<Arc<files::Pack>>),
 }
 
 pub type Notify = Arc<dyn Fn(SessionEvent) + Send + Sync>;
+
+/// See [`Session::files_setter`].
+#[derive(Clone)]
+pub struct FilesSetter(mpsc::UnboundedSender<Command>);
+
+impl FilesSetter {
+    pub fn set(&self, pack: Option<files::Pack>) {
+        let _ = self.0.send(Command::Files(pack.map(Arc::new)));
+    }
+}
 
 pub struct Session {
     room: String,
@@ -224,6 +259,28 @@ impl Session {
     pub fn subtitle(&self, text: String) {
         let _ = self.commands.send(Command::Subtitle(text));
     }
+
+    /// What our own stream is playing (sent to viewers, if the server
+    /// relays it).
+    pub fn now_playing(&self, now: NowPlaying) {
+        let _ = self.commands.send(Command::NowPlaying(now));
+    }
+
+    /// Files for our viewers (subtitle tracks and fonts), or None for none.
+    pub fn set_files(&self, pack: Option<files::Pack>) {
+        self.files_setter().set(pack);
+    }
+
+    /// A handle for setting the files from another thread (they take a
+    /// while to extract).
+    pub fn files_setter(&self) -> FilesSetter {
+        FilesSetter(self.commands.clone())
+    }
+
+    /// Our playback position (passed on to viewers every few seconds).
+    pub fn position(&self, position_ms: u64, paused: bool) {
+        let _ = self.commands.send(Command::Position { position_ms, paused });
+    }
 }
 
 impl Drop for Session {
@@ -298,11 +355,23 @@ async fn run(
         subtitle_lines: false,
         sent_subtitle: String::new(),
         joined: false,
+        now_playing_relayed: false,
+        now_playing: None,
+        position_sent: None,
+        pack: None,
         reconnecting: false,
     };
 
+    let mut stats_timer = tokio::time::interval(STATS_EVERY);
+    let mut last_tick = Instant::now();
     loop {
         tokio::select! {
+            _ = stats_timer.tick() => {
+                if let Some(publisher) = &room.publisher {
+                    telemetry::stream_tick(publisher.viewer_stats(), last_tick.elapsed());
+                }
+                last_tick = Instant::now();
+            }
             event = incoming.recv() => match event {
                 Some(SignalingEvent::Message(msg)) => room.on_message(msg)?,
                 Some(SignalingEvent::Disconnected { retry_in, .. }) => room.disconnected(retry_in),
@@ -342,6 +411,13 @@ struct Room {
     subtitle_lines: bool,
     sent_subtitle: String,
     joined: bool,
+    /// The server relays now-playing and position signals.
+    now_playing_relayed: bool,
+    /// What our stream is playing, and when viewers were last told the position.
+    now_playing: Option<NowPlaying>,
+    position_sent: Option<Instant>,
+    /// Files for viewers (see [`Session::set_files`]).
+    pack: Option<Arc<files::Pack>>,
     reconnecting: bool,
 }
 
@@ -371,7 +447,10 @@ impl Room {
 
     fn on_message(&mut self, msg: ServerMsg) -> Result<()> {
         match msg {
-            ServerMsg::Welcome { you, peers, resumed } => self.welcome(you, peers, resumed),
+            ServerMsg::Welcome { you, peers, resumed, features } => {
+                self.now_playing_relayed = features.iter().any(|f| f == FEATURE_NOW_PLAYING);
+                self.welcome(you, peers, resumed);
+            }
             ServerMsg::PeerJoined { peer } => {
                 self.update(|s| s.upsert(peer));
                 self.reconcile();
@@ -454,6 +533,12 @@ impl Room {
         match signal {
             Signal::Offer { sdp } if self.watching == Some(from) => self.receive(from, sdp),
             Signal::Subtitle { text } if self.watching == Some(from) => (self.notify)(SessionEvent::Subtitle(text)),
+            Signal::NowPlaying { file, duration_ms, anime } if self.watching == Some(from) => {
+                (self.notify)(SessionEvent::NowPlaying { file, duration_ms, anime });
+            }
+            Signal::Position { position_ms, paused } if self.watching == Some(from) => {
+                (self.notify)(SessionEvent::Position { position_ms, paused });
+            }
             Signal::Watch | Signal::Unwatch | Signal::Answer { .. } | Signal::KeyframeRequest => {
                 let name = self.name_of(from);
                 let Some(publisher) = self.publisher.as_mut() else { return };
@@ -461,6 +546,9 @@ impl Room {
                 publisher.handle(from, &name, &signal);
                 if watch && !self.sent_subtitle.is_empty() {
                     self.signaling.signal(from, Signal::Subtitle { text: self.sent_subtitle.clone() });
+                }
+                if watch && let Some(now) = self.now_playing.clone() {
+                    self.send_now_playing_to(from, now);
                 }
             }
             _ => {}
@@ -491,12 +579,17 @@ impl Room {
                     return;
                 }
                 let title = source.title.clone();
-                self.subtitle_lines = !matches!(source.subtitles, Some(BurnIn::Text { .. }));
+                // Text lines only when there's nothing better: not drawn in,
+                // and not sent as tracks.
+                self.subtitle_lines = !source.tracks_for_viewers && !matches!(source.subtitles, Some(BurnIn::Text { .. }));
                 self.send_subtitle();
                 let restart = self.pipeline.take().is_some(); // stop any previous one first
+                let pack = self.pack.clone();
                 let publisher = self.publisher.get_or_insert_with(|| {
                     let log = Arc::new(|line: String| eprintln!("[mpvlink] {line}"));
-                    Publisher::new(self.signaling.clone(), self.config.ice_servers.clone(), true, log)
+                    let publisher = Publisher::new(self.signaling.clone(), self.config.ice_servers.clone(), true, log);
+                    publisher.set_pack(pack);
+                    publisher
                 });
                 let frames = publisher.frames();
                 self.pipeline = Some(Pipeline::start(*source, frames, self.pipeline_events.clone()));
@@ -512,6 +605,39 @@ impl Room {
                 self.subtitle = text;
                 self.send_subtitle();
             }
+            Command::NowPlaying(now) => {
+                if self.now_playing.as_ref() == Some(&now) {
+                    return;
+                }
+                self.now_playing = Some(now.clone());
+                for viewer in self.publisher.as_ref().map(Publisher::watchers).unwrap_or_default() {
+                    self.send_now_playing_to(viewer, now.clone());
+                }
+            }
+            Command::Files(pack) => {
+                if let Some(p) = &self.publisher {
+                    p.set_pack(pack.clone());
+                }
+                self.pack = pack;
+            }
+            Command::Position { position_ms, paused } => {
+                let due = self.position_sent.is_none_or(|t| t.elapsed() >= POSITION_EVERY);
+                if !due || !self.now_playing_relayed || self.now_playing.is_none() {
+                    return;
+                }
+                self.position_sent = Some(Instant::now());
+                for viewer in self.publisher.as_ref().map(Publisher::watchers).unwrap_or_default() {
+                    self.signaling.signal(viewer, Signal::Position { position_ms, paused });
+                }
+            }
+        }
+    }
+
+    /// Tell a viewer what we're playing, if the server can relay it.
+    fn send_now_playing_to(&self, viewer: PeerId, now: NowPlaying) {
+        if self.now_playing_relayed {
+            let NowPlaying { file, duration_ms, anime } = now;
+            self.signaling.signal(viewer, Signal::NowPlaying { file, duration_ms, anime });
         }
     }
 
@@ -531,7 +657,10 @@ impl Room {
 
     fn on_pipeline(&mut self, event: PipelineEvent) {
         match event {
-            PipelineEvent::Started { encoder, kbps } => eprintln!("[mpvlink] streaming with {encoder} at {kbps} kb/s"),
+            PipelineEvent::Started { encoder, kbps } => {
+                eprintln!("[mpvlink] streaming with {encoder} at {kbps} kb/s");
+                telemetry::stream_started(&encoder, kbps);
+            }
             PipelineEvent::TextSubtitlesUnsupported => {
                 self.subtitle_lines = true;
                 self.send_subtitle();
@@ -546,6 +675,9 @@ impl Room {
         }
         self.pipeline = None;
         self.publisher = None; // ends every viewer's connection
+        self.now_playing = None;
+        self.pack = None;
+        telemetry::stream_stopped();
         self.subtitle.clear();
         self.sent_subtitle.clear();
         self.signaling.set_streaming(false);
@@ -605,6 +737,7 @@ impl Room {
         if let Some(task) = self.receiver.take() {
             task.abort();
         }
+        telemetry::watch_stopped();
         if self.watching.take().is_some() {
             (self.notify)(SessionEvent::Subtitle(String::new()));
         }
@@ -662,12 +795,21 @@ impl Receiver {
 
         let mut readers: Vec<JoinHandle<()>> = Vec::new();
         let started = Arc::new(Started::default());
+        telemetry::watch_started(&self.name);
+        // The connection's stats, for the statistics panel.
+        let mut stats_timer = tokio::time::interval(STATS_EVERY);
         let result = loop {
             let event = match deferred.pop() {
                 Some(e) => e,
-                None => match events.recv().await {
-                    Some(e) => e,
-                    None => break Ok(()),
+                None => tokio::select! {
+                    event = events.recv() => match event {
+                        Some(e) => e,
+                        None => break Ok(()),
+                    },
+                    _ = stats_timer.tick() => {
+                        telemetry::watch_link(link_stats(&pc).await);
+                        continue;
+                    }
                 },
             };
             match event {
@@ -676,6 +818,9 @@ impl Receiver {
                 }
                 PeerEvent::State(s @ (ConnectionState::Failed | ConnectionState::Closed)) => {
                     break Err(anyhow::anyhow!("connection {s}"));
+                }
+                PeerEvent::DataChannel(channel) if channel.label().await.is_ok_and(|l| l == files::LABEL) => {
+                    readers.push(tokio::spawn(read_files(channel, self.publisher, self.notify.clone())));
                 }
                 PeerEvent::Track(track) => {
                     let task = if track.kind().await == RtpCodecKind::Audio {
@@ -717,7 +862,14 @@ struct Started {
     audio: AtomicBool,
 }
 
-/// Reassemble RTP into frames and queue them for mpv.
+/// How often viewers are told the playback position.
+const POSITION_EVERY: Duration = Duration::from_secs(5);
+
+/// How often connection stats are read for the statistics panel.
+const STATS_EVERY: Duration = Duration::from_secs(1);
+
+/// Reassemble RTP into frames and queue them for mpv, each to be shown at
+/// the time [`Playout`] picks. Logs how evenly they arrive.
 async fn read_video(
     track: Arc<dyn TrackRemote>,
     (publisher, name): (PeerId, String),
@@ -728,14 +880,39 @@ async fn read_video(
 ) {
     let mut assembler = FrameAssembler::new();
     let mut last_request: Option<Instant> = None;
+    let mut playout = Playout::new();
+    // Packet trouble since the last report: gaps, and packets that came
+    // after later ones (out of order).
+    let (mut losses, mut out_of_order) = (0u32, 0u32);
+    let mut newest_seq: Option<u16> = None;
 
     while let Some(event) = track.poll().await {
         let TrackRemoteEvent::OnRtpPacket(packet) = event else { continue };
-        let pushed = assembler.push(packet.header.sequence_number, packet.header.marker, &packet.payload);
+        let seq = packet.header.sequence_number;
+        if newest_seq.is_some_and(|n| seq.wrapping_sub(n) >= 0x8000) {
+            out_of_order += 1;
+        } else {
+            newest_seq = Some(seq);
+        }
+        let pushed = assembler.push(seq, packet.header.marker, &packet.payload);
+        telemetry::media_received(packet.payload.len());
+        losses += u32::from(pushed.lost);
+        let reordered = newest_seq != Some(seq);
+        if pushed.lost || reordered {
+            telemetry::packets(u32::from(pushed.lost), u32::from(reordered));
+        }
         let mut want_keyframe = pushed.lost || assembler.waiting_for_keyframe();
         if let Some(frame) = pushed.frame {
             let keyframe = is_keyframe(&frame);
-            want_keyframe |= media.video.push(frame, keyframe);
+            let smoothing = jitter::smoothing();
+            let show = playout.schedule(Instant::now(), packet.header.timestamp, smoothing);
+            telemetry::frame_received(playout.last_frame());
+            let position = mpvlink_rtc::h264::read_position(&frame);
+            want_keyframe |= media.video.push(frame, keyframe, show, position);
+            if let Some(report) = playout.report(smoothing) {
+                eprintln!("[mpvlink] receiving: {report}; {losses} losses, {out_of_order} out of order");
+                (losses, out_of_order) = (0, 0);
+            }
             if keyframe && !started.video.swap(true, Ordering::SeqCst) {
                 // Audio arrives continuously, so by the first keyframe it's
                 // flowing if the stream has any.
@@ -748,6 +925,43 @@ async fn read_video(
             last_request = Some(Instant::now());
         }
     }
+}
+
+/// Files from the streamer (subtitle tracks and their fonts): each pack is
+/// saved in a fresh temporary folder, and the plugin told where.
+async fn read_files(channel: Arc<dyn DataChannel>, peer: PeerId, notify: Notify) {
+    static PACKS: AtomicU64 = AtomicU64::new(0);
+    let mut receiver = files::Receiver::default();
+    while let Some(event) = channel.poll().await {
+        let DataChannelEvent::OnMessage(message) = event else { continue };
+        match receiver.message(&message.data, message.is_string) {
+            Some(files::Received::Pack(pack)) => {
+                let n = PACKS.fetch_add(1, Ordering::SeqCst);
+                let dir = std::env::temp_dir().join(format!("mpvlink-files-{}-{n}", std::process::id()));
+                match save_pack(&dir, pack) {
+                    Ok(files) => notify(SessionEvent::Files { peer, dir: dir.to_string_lossy().into_owned(), files }),
+                    Err(e) => eprintln!("[mpvlink] saving the streamer's files failed: {e}"),
+                }
+            }
+            Some(files::Received::Clear) => notify(SessionEvent::FilesCleared { peer }),
+            None => {}
+        }
+    }
+}
+
+/// Write a pack's files into `dir`; their paths and descriptions. Names are
+/// reduced to a plain file name, so a pack can't write outside `dir`.
+fn save_pack(dir: &std::path::Path, pack: files::Pack) -> std::io::Result<Vec<(String, serde_json::Value)>> {
+    std::fs::create_dir_all(dir)?;
+    let mut saved = Vec::new();
+    for (i, file) in pack.files.into_iter().enumerate() {
+        let name = std::path::Path::new(&file.name).file_name().map(|n| n.to_string_lossy().into_owned());
+        let name = name.filter(|n| !n.is_empty() && n != "..").unwrap_or_else(|| format!("file{i}"));
+        let path = dir.join(name);
+        std::fs::write(&path, &file.data)?;
+        saved.push((path.to_string_lossy().into_owned(), file.meta));
+    }
+    Ok(saved)
 }
 
 /// Opus packets go to mpv as they come (one per RTP packet).
@@ -763,7 +977,9 @@ async fn read_audio(
         if packet.payload.is_empty() {
             continue;
         }
-        audio.push(packet.payload);
+        telemetry::media_received(packet.payload.len());
+        // Held back as long as video is, for lip sync.
+        audio.push(packet.payload, Instant::now() + jitter::video_hold());
         // Sound that starts after the picture (e.g. the streamer switched to
         // a file with audio): mpv needs to add the track.
         if started.video.load(Ordering::SeqCst) && !started.audio.swap(true, Ordering::SeqCst) {

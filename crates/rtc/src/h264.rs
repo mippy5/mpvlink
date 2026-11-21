@@ -120,6 +120,76 @@ impl FrameAssembler {
     }
 }
 
+// ---- Frame positions ------------------------------------------------------------
+//
+// Each video frame carries its position in the streamed file (seconds), so
+// a viewer can play the stream on the file's timeline (and time subtitle
+// tracks to it). It rides in an SEI "user data unregistered" message, which
+// decoders ignore.
+
+/// Identifies our SEI message (16 bytes, as the format requires).
+const POSITION_UUID: &[u8; 16] = b"mpvlink.position";
+const NAL_SEI: u8 = 6;
+const SEI_USER_DATA_UNREGISTERED: u8 = 5;
+
+/// The SEI NAL unit (without start code) carrying `position`.
+pub fn position_sei(position: f64) -> Vec<u8> {
+    let mut payload = POSITION_UUID.to_vec();
+    payload.extend(position.to_be_bytes());
+    let mut rbsp = vec![SEI_USER_DATA_UNREGISTERED, payload.len() as u8];
+    rbsp.extend(payload);
+    rbsp.push(0x80); // rbsp_trailing_bits
+    let mut nal = vec![NAL_SEI];
+    // Emulation prevention: never 00 00 followed by 00..03 inside a NAL.
+    let mut zeros = 0;
+    for b in rbsp {
+        if zeros >= 2 && b <= 3 {
+            nal.push(3);
+            zeros = 0;
+        }
+        nal.push(b);
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+    }
+    nal
+}
+
+/// The position our SEI message in this Annex B frame carries, if any.
+pub fn read_position(annex_b: &[u8]) -> Option<f64> {
+    nal_units(annex_b).filter(|nal| nal[0] & 0x1F == NAL_SEI).find_map(|nal| {
+        // Undo emulation prevention.
+        let mut rbsp = Vec::with_capacity(nal.len());
+        let mut zeros = 0;
+        for &b in &nal[1..] {
+            if zeros >= 2 && b == 3 {
+                zeros = 0;
+                continue;
+            }
+            rbsp.push(b);
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+        }
+        let rest = rbsp.strip_prefix(&[SEI_USER_DATA_UNREGISTERED, 24])?;
+        let value = rest.strip_prefix(POSITION_UUID.as_slice())?;
+        Some(f64::from_be_bytes(value.get(..8)?.try_into().ok()?))
+    })
+}
+
+/// Put `sei` (a NAL unit) in an Annex B frame (with 4-byte start codes),
+/// before its first slice, as SEI messages must be.
+pub fn insert_before_slices(frame: &[u8], sei: &[u8]) -> Bytes {
+    let mut out = BytesMut::with_capacity(frame.len() + sei.len() + 8);
+    let mut inserted = false;
+    for nal in nal_units(frame) {
+        if !inserted && matches!(nal[0] & 0x1F, 1 | NAL_IDR) {
+            out.put_slice(START_CODE);
+            out.put_slice(sei);
+            inserted = true;
+        }
+        out.put_slice(START_CODE);
+        out.put_slice(nal);
+    }
+    out.freeze()
+}
+
 /// Convert an Annex B frame to a list of NAL units with 4-byte start codes,
 /// which is the form `TrackLocalStaticSample` packetizes from, leaving out
 /// NAL units of the types in `skip`.
@@ -145,6 +215,19 @@ mod tests {
     }
     fn p_slice() -> Bytes {
         Bytes::from_static(&[0x41, 0x9A, 0x02, 0x00])
+    }
+
+    #[test]
+    fn positions_round_trip_through_sei() {
+        for position in [0.0, 1.0 / 3.0, 300.125, 1.0e-300, f64::from_bits(0x0000_0003_0000_0001)] {
+            let frame = [&[0u8, 0, 0, 1][..], &sps(), &[0, 0, 0, 1], &idr()].concat();
+            let tagged = insert_before_slices(&frame, &position_sei(position));
+            assert_eq!(read_position(&tagged), Some(position), "{position}");
+            let types: Vec<u8> = nal_units(&tagged).map(|n| n[0] & 0x1F).collect();
+            assert_eq!(types, vec![7, 6, 5], "SPS, SEI, then the slice");
+            assert!(!position_sei(position)[1..].windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] < 3), "escaped (00 00 03 is the escape itself)");
+        }
+        assert_eq!(read_position(&[0, 0, 0, 1, 0x65, 1]), None);
     }
 
     #[test]

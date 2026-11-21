@@ -114,7 +114,7 @@ cargo run --release -p mpvlink-send -- --server wss://signal.example.com --room 
 to also test NAT traversal):
 
 ```sh
-mpv --idle=yes --script=target/release/mpvlink.so \
+mpv --idle=yes --force-window=yes --script=target/release/mpvlink.so \
     --script-opts=mpvlink-server=wss://signal.example.com
 ```
 

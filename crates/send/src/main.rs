@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
             None => bail!("disconnected from the signaling server"),
         };
         match msg {
-            ServerMsg::Welcome { you, peers, resumed } => {
+            ServerMsg::Welcome { you, peers, resumed, .. } => {
                 if !welcomed {
                     println!("Streaming to room {} as {} (peer {you}). Waiting for viewers…", args.room, args.name);
                 } else if resumed {

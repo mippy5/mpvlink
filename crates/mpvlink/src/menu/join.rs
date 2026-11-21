@@ -34,6 +34,8 @@ impl Field {
 }
 
 pub struct JoinMenu {
+    /// No signaling server is set: Join and Create room lead to Settings.
+    needs_server: bool,
     name: String,
     code: String,
     focus: Field,
@@ -48,8 +50,9 @@ impl JoinMenu {
 
     /// `name` pre-fills the display name (e.g. from the last time the menu was
     /// open). If it's set, focus starts on the room code.
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str, needs_server: bool) -> Self {
         let mut menu = Self {
+            needs_server,
             name: String::new(),
             code: String::new(),
             focus: Field::Name,
@@ -62,6 +65,10 @@ impl JoinMenu {
             menu.focus = Field::Code;
         }
         menu
+    }
+
+    pub fn set_needs_server(&mut self, needs: bool) {
+        self.needs_server = needs;
     }
 
     /// The display name as typed so far (untrimmed).
@@ -194,6 +201,9 @@ impl JoinMenu {
     /// Join if everything is valid; otherwise focus the first problem and
     /// show its error.
     pub fn submit(&mut self) -> Action {
+        if self.needs_server {
+            return Action::OpenSettings;
+        }
         match self.validate() {
             Ok((name, code)) => Action::Join { name, code },
             Err(e) => self.fail(e),
@@ -202,6 +212,9 @@ impl JoinMenu {
 
     /// Create a new room. Only the name is needed; any typed code is ignored.
     pub fn create(&mut self) -> Action {
+        if self.needs_server {
+            return Action::OpenSettings;
+        }
         match self.validate_name() {
             Ok(name) => Action::Create { name },
             Err(e) => self.fail(e),
@@ -230,8 +243,14 @@ impl JoinMenu {
 
     pub fn render(&self, l: &Layout) -> String {
         let mut ass = Ass::new();
-        draw_panel(&mut ass, l, "Join a room", "Pick a name, then join with a code or start a new room.");
-        draw_button(&mut ass, l.header, "Settings", ButtonKind::Ghost, self.hover == Hit::Header);
+        if self.needs_server {
+            // First things first: the Settings button is the one to press.
+            draw_panel(&mut ass, l, "Join a room", "First, set your signaling server in Settings.");
+            draw_button(&mut ass, l.header, "Settings", ButtonKind::Primary { enabled: true }, self.hover == Hit::Header);
+        } else {
+            draw_panel(&mut ass, l, "Join a room", "Pick a name, then join with a code or start a new room.");
+            draw_button(&mut ass, l.header, "Settings", ButtonKind::Outline, self.hover == Hit::Header);
+        }
 
         let field = |f: Field, label, placeholder, helper, style| FieldView {
             label,
@@ -273,9 +292,10 @@ impl JoinMenu {
         );
 
         // Buttons: [Create room] ........ [Cancel] [Join]
-        draw_button(&mut ass, l.left, "Create room", ButtonKind::Secondary, self.hover == Hit::Left);
+        let ready = !self.needs_server;
+        draw_button(&mut ass, l.left, "Create room", ButtonKind::Secondary { enabled: ready }, self.hover == Hit::Left);
         draw_button(&mut ass, l.cancel, "Cancel", ButtonKind::Ghost, self.hover == Hit::Cancel);
-        let primary = ButtonKind::Primary { enabled: self.can_join() };
+        let primary = ButtonKind::Primary { enabled: ready && self.can_join() };
         draw_button(&mut ass, l.primary, "Join", primary, self.hover == Hit::Primary);
 
         ass.finish()
@@ -296,7 +316,7 @@ mod tests {
 
     #[test]
     fn code_is_normalized_and_limited() {
-        let mut m = JoinMenu::new("Sam");
+        let mut m = JoinMenu::new("Sam", false);
         assert_eq!(m.focus, Field::Code);
         m.insert("ab-c d1 ");
         assert_eq!(m.code, "ABCD1");
@@ -307,7 +327,7 @@ mod tests {
 
     #[test]
     fn name_allows_unicode_but_not_control_or_extra_spaces() {
-        let mut m = JoinMenu::new("");
+        let mut m = JoinMenu::new("", false);
         assert_eq!(m.focus, Field::Name);
         m.insert("  Zoë\tthe {cat}\n");
         assert_eq!(m.name, "Zoë the {cat} ");
@@ -317,7 +337,7 @@ mod tests {
 
     #[test]
     fn tab_cycles_focus_and_edits_follow_it() {
-        let mut m = JoinMenu::new("");
+        let mut m = JoinMenu::new("", false);
         m.insert("ann");
         m.focus_next();
         m.insert("room");
@@ -330,7 +350,7 @@ mod tests {
 
     #[test]
     fn submit_focuses_first_invalid_field() {
-        let mut m = JoinMenu::new("");
+        let mut m = JoinMenu::new("", false);
         m.focus(Field::Code);
         m.insert("abcd");
         assert_eq!(m.submit(), Action::Redraw);
@@ -346,7 +366,7 @@ mod tests {
 
     #[test]
     fn short_code_error_stays_until_code_is_edited() {
-        let mut m = JoinMenu::new("Lee");
+        let mut m = JoinMenu::new("Lee", false);
         m.insert("ab");
         assert_eq!(m.submit(), Action::Redraw);
         m.focus(Field::Name);
@@ -357,7 +377,7 @@ mod tests {
     #[test]
     fn clicks_hit_buttons_and_fields() {
         let l = layout();
-        let mut m = JoinMenu::new("Kai");
+        let mut m = JoinMenu::new("Kai", false);
         m.insert("room42");
         assert_eq!(m.click(l.hit(l.field(0).center())), Action::Redraw);
         assert_eq!(m.focus, Field::Name);
@@ -370,7 +390,7 @@ mod tests {
     #[test]
     fn create_needs_only_a_name() {
         let l = layout();
-        let mut m = JoinMenu::new("");
+        let mut m = JoinMenu::new("", false);
         m.focus(Field::Code);
         m.insert("ab"); // too short to join, but irrelevant for creating
         assert_eq!(m.click(l.hit(l.left.center())), Action::Redraw);
@@ -383,11 +403,22 @@ mod tests {
     #[test]
     fn buttons_hover() {
         let l = layout();
-        let mut m = JoinMenu::new("");
+        let mut m = JoinMenu::new("", false);
         assert_eq!(m.hover(l.hit(l.left.center())), Action::Redraw);
         assert_eq!(m.hover, Hit::Left);
         assert_eq!(m.hover(l.hit(l.left.center())), Action::None, "no redraw if unchanged");
         assert_eq!(m.hover(l.hit(l.field(0).center())), Action::Redraw);
         assert_eq!(m.hover, Hit::None, "fields don't highlight");
+    }
+
+    #[test]
+    fn without_a_server_join_and_create_lead_to_settings() {
+        let mut m = JoinMenu::new("Ana", true);
+        m.insert("ROOM1");
+        assert_eq!(m.submit(), Action::OpenSettings);
+        assert_eq!(m.create(), Action::OpenSettings);
+        assert!(m.render(&layout()).contains("First, set your signaling server"));
+        m.set_needs_server(false);
+        assert_eq!(m.submit(), join("Ana", "ROOM1"));
     }
 }

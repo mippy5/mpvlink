@@ -3,15 +3,18 @@
   "configurations": [
     // ---- macOS (CodeLLDB) ---------------------------------------------------
     {
-      // Start mpv with nothing to play: the plugin opens the join menu right away.
-      "name": "Debug mpv plugin (join menu)",
+      // Start mpv with nothing to play, on its start screen, which says
+      // "Press Spacebar to join a room" (Space or Ctrl+j opens the menu).
+      // --force-window: with nothing to play, mpv otherwise opens no window.
+      "name": "Debug mpv plugin (start screen)",
       "type": "lldb",
       "request": "launch",
       "preLaunchTask": "build plugin (debug)",
       "program": "/opt/homebrew/bin/mpv",
       "args": [
         "--script=${workspaceFolder}/target/debug/mpvlink.so",
-        "--idle=yes"
+        "--idle=yes",
+        "--force-window=yes"
       ],
       "cwd": "${workspaceFolder}",
       "sourceLanguages": ["rust"],
@@ -40,7 +43,8 @@
     // Build Tools, and mpv 0.37 or newer. The build writes a .pdb next to
     // mpvlink.dll, so breakpoints in src\*.rs bind once mpv loads the plugin.
     {
-      "name": "Windows: Debug mpv plugin (join menu)",
+      // On the start screen, as above.
+      "name": "Windows: Debug mpv plugin (start screen)",
       "type": "cppvsdbg",
       "request": "launch",
       "preLaunchTask": "build plugin (debug)",
@@ -48,7 +52,8 @@
       "args": [
         "--script=${workspaceFolder}\\target\\debug\\mpvlink.dll",
         "--log-file=${workspaceFolder}\\target\\debug\\mpv.log",
-        "--idle=yes"
+        "--idle=yes",
+        "--force-window=yes"
       ],
       "cwd": "${workspaceFolder}",
       // mpv.exe is a GUI program with no terminal here, so mpv's own messages

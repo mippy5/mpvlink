@@ -87,9 +87,10 @@ install: build
 	cp $(PLUGIN) $(SCRIPTS_DIR)/mpvlink.so.tmp
 	mv -f $(SCRIPTS_DIR)/mpvlink.so.tmp $(SCRIPTS_DIR)/mpvlink.so
 
-# Start mpv with nothing loaded; the plugin opens the join menu.
+# Start mpv with nothing loaded (Space opens the menu), using the local
+# signaling server from `make signal`.
 run: build
-	mpv --idle=yes --script=$(PLUGIN)
+	mpv --idle=yes --force-window=yes --script=$(PLUGIN) --script-opts=mpvlink-server=ws://127.0.0.1:8787
 
 signal:
 	cargo run -p mpvlink-signal $(CARGO_FLAGS)

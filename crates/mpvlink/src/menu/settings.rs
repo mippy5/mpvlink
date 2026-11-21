@@ -1,5 +1,6 @@
-//! The "Settings" page: the signaling server address and the ffmpeg used for
-//! streaming your own videos. Its "Advanced" button opens the advanced page.
+//! The "Settings" page: the signaling server address, the ffmpeg used for
+//! streaming your own videos, and the AniList sign-in for list tracking.
+//! Its "Advanced" button opens the advanced page.
 
 use super::{
     Action, ButtonKind, Caret, FieldView, Hit, Layout, MONO_FONT, PASTE_HINT, TEXT, TEXT_FAINT, WARNING,
@@ -10,6 +11,8 @@ use mpvlink_proto::validate_server_url;
 
 /// Long enough for any sensible URL or path.
 pub const MAX_VALUE_CHARS: usize = 256;
+/// AniList's codes (access tokens) run to about a thousand characters.
+const MAX_TOKEN_CHARS: usize = 4096;
 
 /// How many characters of a value fit in a field at the font size used.
 const VISIBLE_CHARS: usize = 36;
@@ -19,10 +22,12 @@ const VISIBLE_CHARS: usize = 36;
 pub enum SettingsField {
     Server,
     Ffmpeg,
+    /// The code (access token) AniList gives after approving mpvlink.
+    AniList,
 }
 
 impl SettingsField {
-    const ALL: [SettingsField; 2] = [SettingsField::Server, SettingsField::Ffmpeg];
+    const ALL: [SettingsField; 3] = [SettingsField::Server, SettingsField::Ffmpeg, SettingsField::AniList];
 
     fn index(self) -> usize {
         self as usize
@@ -34,6 +39,8 @@ impl SettingsField {
 pub struct SettingsValues {
     pub server: String,
     pub ffmpeg: String,
+    /// The AniList code ("" = not signed in).
+    pub anilist: String,
 }
 
 /// What the page shows besides the values themselves.
@@ -44,16 +51,31 @@ pub struct SettingsContext {
     pub ffmpeg_override: Option<String>,
     /// The ffmpeg the current setting finds, or why none was found.
     pub ffmpeg_found: Result<String, String>,
+    /// No server is set yet, and joining a room needs one.
+    pub server_required: bool,
+    /// Who's signed in to AniList, if anyone.
+    pub anilist_user: Option<String>,
+    /// mpvlink has an AniList client id (without one, there's no code to get).
+    pub anilist_ready: bool,
 }
 
 impl Default for SettingsContext {
     fn default() -> Self {
-        Self { server_override: None, ffmpeg_override: None, ffmpeg_found: Err("No ffmpeg found.".into()) }
+        Self {
+            server_override: None,
+            ffmpeg_override: None,
+            ffmpeg_found: Err("No ffmpeg found.".into()),
+            server_required: false,
+            anilist_user: None,
+            anilist_ready: true,
+        }
     }
 }
 
 pub struct SettingsMenu {
-    values: [String; 2],
+    values: [String; 3],
+    /// The code saved when the page opened (to tell a new one apart).
+    saved_anilist: String,
     context: SettingsContext,
     focus: SettingsField,
     /// A validation error and the field it belongs to.
@@ -68,6 +90,7 @@ impl SettingsMenu {
     pub fn new(values: &SettingsValues, context: SettingsContext) -> Self {
         let mut menu = Self {
             values: Default::default(),
+            saved_anilist: values.anilist.clone(),
             context,
             focus: SettingsField::Server,
             error: None,
@@ -76,6 +99,7 @@ impl SettingsMenu {
         };
         menu.insert_into(SettingsField::Server, &values.server);
         menu.insert_into(SettingsField::Ffmpeg, &values.ffmpeg);
+        menu.insert_into(SettingsField::AniList, &values.anilist);
         menu
     }
 
@@ -90,7 +114,8 @@ impl SettingsMenu {
     fn insert_into(&mut self, f: SettingsField, text: &str) -> bool {
         let value = &mut self.values[f.index()];
         let before = value.len();
-        let room = MAX_VALUE_CHARS.saturating_sub(value.chars().count());
+        let max = if f == SettingsField::AniList { MAX_TOKEN_CHARS } else { MAX_VALUE_CHARS };
+        let room = max.saturating_sub(value.chars().count());
         let keep = |c: &char| !c.is_control() && (f == SettingsField::Ffmpeg || !c.is_whitespace());
         value.extend(text.chars().filter(keep).take(room));
         value.len() != before
@@ -161,14 +186,19 @@ impl SettingsMenu {
         }
         // Windows' "Copy as path" adds quotes; they're not part of the path.
         let ffmpeg = self.value(SettingsField::Ffmpeg).trim().trim_matches('"').trim().to_string();
-        Action::SaveSettings { values: SettingsValues { server, ffmpeg } }
+        let anilist = self.value(SettingsField::AniList).trim().to_string();
+        Action::SaveSettings { values: SettingsValues { server, ffmpeg, anilist } }
     }
 
     pub fn click(&mut self, hit: Hit) -> Action {
         match hit {
             Hit::Primary => self.submit(),
             Hit::Cancel => Action::CloseSettings,
-            // "Use default": clear the focused field; saving stores the default.
+            // On an empty AniList field: "Get code" (opens AniList's page).
+            Hit::Left if self.focus == SettingsField::AniList && self.value(SettingsField::AniList).is_empty() => {
+                if self.context.anilist_ready { Action::OpenAniList } else { Action::None }
+            }
+            // "Use default" (or "Sign out"): clear the focused field.
             Hit::Left => {
                 self.values[self.focus.index()].clear();
                 self.edited()
@@ -195,12 +225,20 @@ impl SettingsMenu {
     pub fn render(&self, l: &Layout) -> String {
         let mut ass = Ass::new();
         draw_panel(&mut ass, l, "Settings", "Changes apply the next time you join a room or stream a video.");
-        draw_button(&mut ass, l.header, "Advanced", ButtonKind::Ghost, self.hover == Hit::Header);
+        draw_button(&mut ass, l.header, "Advanced", ButtonKind::Outline, self.hover == Hit::Header);
         let mono = || TextStyle { align: 4, size: 20.0, color: TEXT, font: Some(MONO_FONT), ..Default::default() };
 
-        let default_server = format!("{} (this computer)", crate::DEFAULT_SERVER);
+        let default_server = if self.context.server_required {
+            "e.g. wss://signal.example.com".to_string()
+        } else {
+            format!("{} (this computer)", crate::DEFAULT_SERVER)
+        };
         let (helper, helper_color) = match &self.context.server_override {
             Some(url) => (format!("Overridden by --script-opts: {url}"), WARNING),
+            // Saving with nothing typed leaves it unset.
+            None if self.context.server_required && self.value(SettingsField::Server).trim().is_empty() => {
+                (format!("Needed to join or create rooms: ask whoever runs yours · {PASTE_HINT}"), WARNING)
+            }
             None => (format!("e.g. wss://signal.example.com · Tab for the next field · {PASTE_HINT}"), TEXT_FAINT),
         };
         let server = SettingsField::Server;
@@ -244,8 +282,49 @@ impl SettingsMenu {
             },
         );
 
-        // Buttons: [Use default] ........ [Cancel] [Save]
-        draw_button(&mut ass, l.left, "Use default", ButtonKind::Secondary, self.hover == Hit::Left);
+        let anilist = SettingsField::AniList;
+        let token = self.value(anilist);
+        // The code itself is a password of sorts: show only its end.
+        let shown = match token.chars().count() {
+            0 => String::new(),
+            n => format!("{} {}", "•".repeat(12), token.chars().skip(n.saturating_sub(6)).collect::<String>()),
+        };
+        let (helper, helper_color) = match (&self.context.anilist_user, token.is_empty()) {
+            (Some(user), false) if token == self.saved_anilist => {
+                (format!("Signed in as {user} · episodes you watch are added to your list"), TEXT_FAINT)
+            }
+            _ if !self.context.anilist_ready => {
+                ("Not available in this build (it has no AniList client id).".to_string(), WARNING)
+            }
+            (_, false) => ("Save to sign in with this code".to_string(), TEXT_FAINT),
+            (_, true) => (format!("Get code, approve mpvlink on AniList, then paste the code · {PASTE_HINT}"), TEXT_FAINT),
+        };
+        draw_field(
+            &mut ass,
+            l.field(anilist.index()),
+            &FieldView {
+                label: "ANILIST (KEEPS YOUR LIST UP TO DATE)",
+                value: &shown,
+                placeholder: "Not signed in",
+                helper: &helper,
+                helper_color,
+                error: self.error_for(anilist),
+                focused: self.focus == anilist,
+                caret_visible: self.focus == anilist && self.caret.visible(),
+                style: mono(),
+                max_visible_chars: Some(VISIBLE_CHARS),
+            },
+        );
+
+        // Buttons: [Use default] ........ [Cancel] [Save]. On the AniList
+        // field the left one gets the code, or signs out.
+        let left = match (self.focus == anilist, token.is_empty()) {
+            (true, true) => "Get code",
+            (true, false) => "Sign out",
+            _ => "Use default",
+        };
+        let enabled = !(self.focus == anilist && token.is_empty() && !self.context.anilist_ready);
+        draw_button(&mut ass, l.left, left, ButtonKind::Secondary { enabled }, self.hover == Hit::Left);
         draw_button(&mut ass, l.cancel, "Cancel", ButtonKind::Ghost, self.hover == Hit::Cancel);
         draw_button(&mut ass, l.primary, "Save", ButtonKind::Primary { enabled: true }, self.hover == Hit::Primary);
 
@@ -263,11 +342,29 @@ mod tests {
 
     fn menu(server: &str, ffmpeg: &str) -> SettingsMenu {
         let context = SettingsContext { ffmpeg_found: Ok("/usr/bin/ffmpeg".into()), ..Default::default() };
-        SettingsMenu::new(&SettingsValues { server: server.into(), ffmpeg: ffmpeg.into() }, context)
+        SettingsMenu::new(&SettingsValues { server: server.into(), ffmpeg: ffmpeg.into(), ..Default::default() }, context)
     }
 
     fn saved(server: &str, ffmpeg: &str) -> Action {
-        Action::SaveSettings { values: SettingsValues { server: server.into(), ffmpeg: ffmpeg.into() } }
+        Action::SaveSettings { values: SettingsValues { server: server.into(), ffmpeg: ffmpeg.into(), ..Default::default() } }
+    }
+
+    #[test]
+    fn anilist_code_get_paste_and_sign_out() {
+        let l = layout();
+        let mut m = menu("", "");
+        m.focus_next();
+        m.focus_next();
+        assert_eq!(m.focus, SettingsField::AniList);
+        assert_eq!(m.click(l.hit(l.left.center())), Action::OpenAniList, "Get code");
+        m.insert("abc.def-ghi_123456");
+        let ass = m.render(&l);
+        assert!(!ass.contains("abc.def"), "the code is masked");
+        assert!(ass.contains("123456"));
+        let Action::SaveSettings { values } = m.submit() else { panic!() };
+        assert_eq!(values.anilist, "abc.def-ghi_123456");
+        assert_eq!(m.click(l.hit(l.left.center())), Action::Redraw, "Sign out clears it");
+        assert!(m.value(SettingsField::AniList).is_empty());
     }
 
     #[test]
@@ -331,10 +428,22 @@ mod tests {
             server_override: Some("wss://cli.example".into()),
             ffmpeg_override: None,
             ffmpeg_found: Err("No ffmpeg found.".into()),
+            server_required: false,
+            anilist_user: None,
+            anilist_ready: true,
         };
         let ass = SettingsMenu::new(&SettingsValues::default(), context).render(&layout());
         assert!(ass.contains("Overridden by --script-opts: wss://cli.example"));
         assert!(ass.contains("No ffmpeg found. Streaming needs ffmpeg."));
         assert!(menu("", "").render(&layout()).contains("Using /usr/bin/ffmpeg"));
+    }
+
+    #[test]
+    fn says_when_a_server_is_needed() {
+        let context = SettingsContext { server_required: true, ..Default::default() };
+        let mut m = SettingsMenu::new(&SettingsValues::default(), context);
+        assert!(m.render(&layout()).contains("Needed to join or create rooms"));
+        m.insert("wss://signal.example.com");
+        assert!(!m.render(&layout()).contains("Needed to join"), "not once one is typed");
     }
 }

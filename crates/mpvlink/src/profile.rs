@@ -20,6 +20,13 @@ pub struct Profile {
     pub ffmpeg: String,
     /// Stream bitrate as `6000`, `source` or `1.5x`; empty means the default.
     pub bitrate: String,
+    /// Smoothing of watched streams: `off`, `auto` or ms; empty means auto.
+    pub smoothing: String,
+    /// `on` shows the statistics panel; empty means off.
+    pub stats: String,
+    /// `tracks`: viewers get the subtitle tracks to choose from; empty
+    /// means they're drawn into the picture.
+    pub viewer_subtitles: String,
     /// STUN server URL, `no` for none; empty means the default.
     pub stun: String,
 }
@@ -55,6 +62,9 @@ impl Profile {
                 "server" => profile.server = value,
                 "ffmpeg" => profile.ffmpeg = value,
                 "bitrate" => profile.bitrate = value,
+                "smoothing" => profile.smoothing = value,
+                "stats" => profile.stats = value,
+                "viewer_subtitles" => profile.viewer_subtitles = value,
                 "stun" => profile.stun = value,
                 _ => {}
             }
@@ -72,6 +82,9 @@ impl Profile {
             ("server", &self.server),
             ("ffmpeg", &self.ffmpeg),
             ("bitrate", &self.bitrate),
+            ("smoothing", &self.smoothing),
+            ("stats", &self.stats),
+            ("viewer_subtitles", &self.viewer_subtitles),
             ("stun", &self.stun),
         ] {
             let value = clean(value);
@@ -94,6 +107,9 @@ mod tests {
             server: "wss://signal.example.com:8443/x?a=b".into(),
             ffmpeg: r"C:\Program Files\ffmpeg\bin\ffmpeg.exe".into(),
             bitrate: "1.5x".into(),
+            smoothing: "off".into(),
+            stats: "on".into(),
+            viewer_subtitles: "tracks".into(),
             stun: "stun:stun.example.com:3478".into(),
         };
         assert_eq!(Profile::parse(&p.serialize()), p);

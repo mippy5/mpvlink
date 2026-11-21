@@ -1,8 +1,10 @@
-//! A minimal live WebM (Matroska) writer for one Opus track: how received
-//! audio is handed to mpv.
+//! A minimal live Matroska writer for one track: how received media is
+//! handed to mpv. Opus audio (as WebM) always; H.264 video when the stream
+//! should play on the streamed file's timeline (viewers choosing subtitle
+//! tracks need that; plain raw H.264 has no timestamps).
 //!
 //! The stream is a header (EBML header, a Segment of unknown size, Info and
-//! Tracks) followed by one Cluster per Opus packet. Clusters are
+//! Tracks) followed by one Cluster per packet or frame. Clusters are
 //! self-contained, so packets can be dropped anywhere to keep latency down.
 
 /// Opus at 48 kHz (always, for Opus), stereo (what the sender encodes).
@@ -12,12 +14,72 @@ const PRE_SKIP: u16 = 312;
 
 /// The stream header: everything before the first audio packet.
 pub fn header() -> Vec<u8> {
+    let audio = [
+        element(0xB5, &48_000f64.to_be_bytes()), // SamplingFrequency
+        element(0x9F, &uint(CHANNELS.into())),   // Channels
+    ]
+    .concat();
+    let track = [
+        element(0xD7, &uint(1)),       // TrackNumber
+        element(0x73C5, &uint(1)),     // TrackUID
+        element(0x83, &uint(2)),       // TrackType: audio
+        element(0x86, b"A_OPUS"),      // CodecID
+        element(0x63A2, &opus_head()), // CodecPrivate
+        element(0xE1, &audio),         // Audio
+    ]
+    .concat();
+    stream_header(b"webm", &track)
+}
+
+/// The header of an H.264 video stream whose parameter sets are `sps` and
+/// `pps` (NAL units, without start codes).
+pub fn video_header(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let track = [
+        element(0xD7, &uint(1)),                // TrackNumber
+        element(0x73C5, &uint(1)),              // TrackUID
+        element(0x83, &uint(1)),                // TrackType: video
+        element(0x86, b"V_MPEG4/ISO/AVC"),      // CodecID
+        element(0x63A2, &avc_config(sps, pps)), // CodecPrivate
+    ]
+    .concat();
+    stream_header(b"matroska", &track)
+}
+
+/// A Cluster holding one video frame (Annex B) at `timecode_ms`.
+pub fn video_cluster(timecode_ms: u64, keyframe: bool, annex_b: &[u8]) -> Vec<u8> {
+    // SimpleBlock: track 1, timecode 0 relative to the cluster, flags.
+    let mut block = vec![0x81, 0x00, 0x00, if keyframe { 0x80 } else { 0x00 }];
+    // Matroska's H.264 is length-prefixed; access unit delimiters (which
+    // only mattered to Annex B parsing) are left out.
+    for nal in mpvlink_rtc::h264::nal_units(annex_b).filter(|n| n[0] & 0x1F != 9) {
+        block.extend((nal.len() as u32).to_be_bytes());
+        block.extend_from_slice(nal);
+    }
+    let body = [element(0xE7, &uint(timecode_ms)), element(0xA3, &block)].concat();
+    element(0x1F43B675, &body)
+}
+
+/// AVCDecoderConfigurationRecord (ISO 14496-15): profile and level from
+/// the SPS, 4-byte NAL lengths, one SPS and one PPS.
+fn avc_config(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut out = vec![1, sps.get(1).copied().unwrap_or(66), sps.get(2).copied().unwrap_or(0), sps.get(3).copied().unwrap_or(31)];
+    out.push(0xFF); // 6 reserved bits, lengthSizeMinusOne = 3
+    out.push(0xE1); // 3 reserved bits, one SPS
+    out.extend((sps.len() as u16).to_be_bytes());
+    out.extend_from_slice(sps);
+    out.push(1); // one PPS
+    out.extend((pps.len() as u16).to_be_bytes());
+    out.extend_from_slice(pps);
+    out
+}
+
+fn stream_header(doc_type: &[u8], track: &[u8]) -> Vec<u8> {
     let ebml = [
         element(0x4286, &uint(1)),     // EBMLVersion
         element(0x42F7, &uint(1)),     // EBMLReadVersion
         element(0x42F2, &uint(4)),     // EBMLMaxIDLength
         element(0x42F3, &uint(8)),     // EBMLMaxSizeLength
-        element(0x4282, b"webm"),      // DocType
+        element(0x4282, doc_type),     // DocType
         element(0x4287, &uint(4)),     // DocTypeVersion
         element(0x4285, &uint(2)),     // DocTypeReadVersion
     ]
@@ -28,21 +90,7 @@ pub fn header() -> Vec<u8> {
         element(0x5741, b"mpvlink"),         // WritingApp
     ]
     .concat();
-    let audio = [
-        element(0xB5, &48_000f64.to_be_bytes()), // SamplingFrequency
-        element(0x9F, &uint(CHANNELS.into())),   // Channels
-    ]
-    .concat();
-    let track = [
-        element(0xD7, &uint(1)),         // TrackNumber
-        element(0x73C5, &uint(1)),       // TrackUID
-        element(0x83, &uint(2)),         // TrackType: audio
-        element(0x86, b"A_OPUS"),        // CodecID
-        element(0x63A2, &opus_head()),   // CodecPrivate
-        element(0xE1, &audio),           // Audio
-    ]
-    .concat();
-    let tracks = element(0xAE, &track); // TrackEntry
+    let tracks = element(0xAE, track); // TrackEntry
 
     let mut out = element(0x1A45DFA3, &ebml);
     out.extend(id(0x18538067)); // Segment, of unknown size: it's live

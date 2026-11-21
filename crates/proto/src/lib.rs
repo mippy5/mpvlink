@@ -87,6 +87,10 @@ pub enum ServerMsg {
         /// peers were never told you left. False means a fresh start.
         #[serde(default)]
         resumed: bool,
+        /// What this server can relay beyond the basics (see `FEATURE_*`).
+        /// Older servers send none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
     PeerJoined { peer: PeerInfo },
     /// Someone started or stopped streaming.
@@ -111,7 +115,35 @@ pub enum Signal {
     KeyframeRequest,
     /// Streamer -> viewer: the subtitle line shown now ("" when there's none).
     Subtitle { text: String },
+    /// Streamer -> viewer: what's playing, for list tracking. Only sent to
+    /// servers with [`FEATURE_NOW_PLAYING`].
+    NowPlaying {
+        /// The file's name (without folders).
+        file: String,
+        duration_ms: u64,
+        /// The streamer's AniList match, once it has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anime: Option<AnimeEpisode>,
+    },
+    /// Streamer -> viewer: playback position, every few seconds.
+    Position { position_ms: u64, paused: bool },
 }
+
+/// An episode of a show on AniList.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AnimeEpisode {
+    pub media_id: u32,
+    pub episode: u32,
+    /// For display: the show's title.
+    pub title: String,
+    /// How many episodes the show has, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episodes: Option<u32>,
+}
+
+/// Server feature: relays `now_playing` and `position` signals. (Older
+/// servers reject unknown signals and close the connection.)
+pub const FEATURE_NOW_PLAYING: &str = "now_playing";
 
 /// Normalize a room code: uppercase letters and digits only. Returns None if
 /// the result isn't a valid length. Clients and server use the same rules.
@@ -184,7 +216,16 @@ mod tests {
         assert_eq!(serde_json::to_string(&msg).unwrap(), r#"{"type":"signal","to":2,"signal":{"kind":"watch"}}"#);
         // Old clients/servers without the resume fields still interoperate.
         let old: ServerMsg = serde_json::from_str(r#"{"type":"welcome","you":1,"peers":[]}"#).unwrap();
-        assert_eq!(old, ServerMsg::Welcome { you: 1, peers: vec![], resumed: false });
+        assert_eq!(old, ServerMsg::Welcome { you: 1, peers: vec![], resumed: false, features: vec![] });
+        // Now-playing signals, with and without a match.
+        let msg = Signal::NowPlaying { file: "Show - 01.mkv".into(), duration_ms: 1_400_000, anime: None };
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            r#"{"kind":"now_playing","file":"Show - 01.mkv","duration_ms":1400000}"#
+        );
+        let anime = AnimeEpisode { media_id: 5, episode: 1, title: "Show".into(), episodes: None };
+        let msg = Signal::NowPlaying { file: "x".into(), duration_ms: 1, anime: Some(anime) };
+        assert_eq!(serde_json::from_str::<Signal>(&serde_json::to_string(&msg).unwrap()).unwrap(), msg);
         let back: ServerMsg = serde_json::from_str(r#"{"type":"peer_left","id":3}"#).unwrap();
         assert_eq!(back, ServerMsg::PeerLeft { id: 3 });
     }

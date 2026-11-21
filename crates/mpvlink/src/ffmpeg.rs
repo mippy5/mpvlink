@@ -8,6 +8,7 @@
 //! ffmpeg at the new position.
 
 use crate::bitrate::{self, Bitrate};
+use crate::jitter::{SendMeter, SmoothClock};
 use crate::mpegts::{Kind, TsDemuxer, TsFrame, opus_samples};
 use crate::substyle::{AssHeader, SubStyle};
 use mpvlink_rtc::h264::is_keyframe;
@@ -20,7 +21,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 /// mpv's playback position in seconds, or None while there isn't one.
@@ -42,6 +43,11 @@ const MAX_DRIFT: f64 = 1.5;
 const SEEK_TOLERANCE: f64 = 0.15;
 /// How often to look at the clock while waiting.
 const POLL: Duration = Duration::from_millis(10);
+/// A frame this close to its time goes now, rather than after another
+/// sleep (which may overshoot by more).
+const DUE_EARLY: f64 = 0.001;
+/// How often to read mpv's playback position.
+const CLOCK_POLL: Duration = Duration::from_millis(4);
 /// Audio goes out this much ahead of its place in playback: about what the
 /// viewer buffers before playing it (video is shown as soon as it arrives),
 /// so the two come out together.
@@ -108,10 +114,15 @@ pub struct StreamSource {
     pub audio: AudioChoice,
     /// Subtitles to draw into the video, as mpv shows them.
     pub subtitles: Option<BurnIn>,
+    /// Viewers get the subtitle tracks as files (see `subexport`), so
+    /// nothing is drawn in and no subtitle text is sent.
+    pub tracks_for_viewers: bool,
     /// The ffmpeg executable.
     pub ffmpeg: String,
     pub bitrate: Bitrate,
     pub clock: Clock,
+    /// mpv's playback speed.
+    pub speed: Clock,
     /// Bumped by the plugin each time mpv finishes a seek.
     pub seeks: Arc<AtomicU64>,
 }
@@ -338,8 +349,36 @@ impl Runner {
         }
     }
 
+    /// Send frames as playback reaches them. A thread of its own reads
+    /// mpv's position into a [`SmoothClock`]: reading it waits on mpv, which
+    /// may be busy, and frames shouldn't go out late because of that.
     fn pace(&self, start: f64, rx: &Receiver<TsFrame>, encoder: &str, announced: &mut bool) -> Ended {
-        let clock = &self.source.clock;
+        crate::jitter::timing_critical();
+        let clock = Mutex::new(SmoothClock::default());
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    let position = (self.source.clock)();
+                    let speed = (self.source.speed)().filter(|s| *s > 0.0).unwrap_or(1.0);
+                    clock.lock().unwrap().update(Instant::now(), position, speed);
+                    std::thread::sleep(CLOCK_POLL);
+                }
+            });
+            let ended = self.pace_frames(start, rx, encoder, announced, &clock);
+            done.store(true, Ordering::Relaxed);
+            ended
+        })
+    }
+
+    fn pace_frames(
+        &self,
+        start: f64,
+        rx: &Receiver<TsFrame>,
+        encoder: &str,
+        announced: &mut bool,
+        clock: &Mutex<SmoothClock>,
+    ) -> Ended {
         let mut seeks = self.source.seeks.load(Ordering::SeqCst);
         // Timestamp of the first frame, which is at `start` in the file.
         let mut base: Option<i64> = None;
@@ -348,6 +387,7 @@ impl Runner {
         let mut finished = false;
         // Behind schedule: dropping video until a keyframe to resume from.
         let mut skipping = false;
+        let mut meter = SendMeter::default();
         // Frames read from ffmpeg, per kind. ffmpeg's output has audio ahead
         // of video (the video encoder holds frames back), so each kind waits
         // in its own queue and whichever is due first goes first.
@@ -373,7 +413,11 @@ impl Runner {
                 .filter_map(|(i, q)| q.front().map(|f| (i, f.at)))
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(i, _)| i);
-            let Some(now) = clock() else {
+            let (now, speed) = {
+                let mut clock = clock.lock().unwrap();
+                (clock.predict(Instant::now()), clock.speed())
+            };
+            let Some(now) = now else {
                 std::thread::sleep(POLL);
                 continue;
             };
@@ -414,7 +458,7 @@ impl Runner {
                     skipping = true;
                 }
             }
-            let due = frame.at <= now + 0.004 || (!frame.audio && skipping);
+            let due = frame.at <= now + DUE_EARLY || (!frame.audio && skipping);
             if !due {
                 // Wait for it, but keep reading: a frame of the other kind
                 // that's due sooner may arrive meanwhile.
@@ -435,7 +479,25 @@ impl Runner {
                     let _ = self.frames.send(Frame::audio(&frame.data, frame.duration));
                 }
             } else if !skipping {
-                let _ = self.frames.send(Frame::new(&frame.data, frame.keyframe, frame.duration));
+                // The RTP timestamp advances by this after the frame, so
+                // it's the time until the next frame where that's known.
+                // Timestamps advance in real time (viewers time frames by
+                // them), so at 2x speed a frame lasts half as long.
+                let duration = match queues[kind].front() {
+                    Some(next) if next.file_time > frame.file_time && next.file_time - frame.file_time < 1.0 => {
+                        Duration::from_secs_f64(next.file_time - frame.file_time)
+                    }
+                    _ => frame.duration,
+                };
+                let duration = duration.div_f64(speed);
+                meter.sent(duration);
+                crate::telemetry::frame_sent(frame.data.len(), meter.last_spread_ms());
+                // Tagged with its place in the file: viewers can play on the
+                // file's timeline (see stream::VideoFormat).
+                let _ = self.frames.send(Frame::video_at(&frame.data, frame.keyframe, duration, frame.file_time));
+                if let Some(report) = meter.report() {
+                    eprintln!("[mpvlink] sending: {report}");
+                }
             }
         }
     }
@@ -741,6 +803,16 @@ impl FontsDir {
     }
 }
 
+/// The fonts attached to `video` (MKV attachments): (file name, bytes).
+pub fn attached_fonts(ffmpeg: &str, video: &str) -> Vec<(String, Vec<u8>)> {
+    let Some(dir) = FontsDir::extract(ffmpeg, video) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir.0) else { return Vec::new() };
+    entries
+        .flatten()
+        .filter_map(|e| Some((e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).ok()?)))
+        .collect()
+}
+
 impl Drop for FontsDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -765,7 +837,7 @@ fn filter_value(value: &str) -> String {
 }
 
 /// ffmpeg is a console program; on Windows, don't flash a console window.
-fn hide_console_window(c: &mut Command) {
+pub fn hide_console_window(c: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -786,9 +858,11 @@ mod tests {
             video_stream: None,
             audio: AudioChoice::Off,
             subtitles,
+            tracks_for_viewers: false,
             ffmpeg: "ffmpeg".into(),
             bitrate: Bitrate::Kbps(1000),
             clock: Arc::new(|| None),
+            speed: Arc::new(|| None),
             seeks: Arc::default(),
         }
     }

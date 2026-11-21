@@ -1,13 +1,14 @@
 //! The "Advanced settings" page (opened from Settings): the bitrate of your
-//! stream and the STUN server. Like the Settings page, it covers what
+//! stream, smoothing of streams you watch, and the STUN server. Like the Settings page, it covers what
 //! --script-opts can set.
 
 use super::{
     ACCENT, Action, ButtonKind, Caret, FIELD, FIELD_EDGE, FieldView, Hit, Layout, MONO_FONT, PASTE_HINT, TEXT,
     TEXT_FAINT, TEXT_MUTED, WARNING, draw_button, draw_field, draw_panel,
 };
-use crate::ass::{Ass, Rect, TextStyle};
+use crate::ass::{Ass, Color, Rect, TextStyle, escape};
 use crate::bitrate::{self, Bitrate};
+use crate::jitter::Smoothing;
 use crate::menu::settings::MAX_VALUE_CHARS;
 
 /// How many characters of the STUN server fit in its field.
@@ -24,11 +25,24 @@ pub enum AdvancedField {
     Mode,
     /// The multiplier or the custom bitrate.
     Amount,
+    /// Off / Auto / fixed delays.
+    Smoothing,
+    /// The statistics panel: Off / On.
+    Stats,
+    /// Subtitles for viewers: drawn in / as tracks.
+    ViewerSubs,
     Stun,
 }
 
 impl AdvancedField {
-    const ALL: [AdvancedField; 3] = [AdvancedField::Mode, AdvancedField::Amount, AdvancedField::Stun];
+    const ALL: [AdvancedField; 6] = [
+        AdvancedField::Mode,
+        AdvancedField::Amount,
+        AdvancedField::Smoothing,
+        AdvancedField::Stats,
+        AdvancedField::ViewerSubs,
+        AdvancedField::Stun,
+    ];
 
     fn index(self) -> usize {
         self as usize
@@ -55,11 +69,25 @@ impl BitrateMode {
     }
 }
 
+/// The smoothing choices offered, and their labels.
+const SMOOTHING_CHOICES: [(Smoothing, &str); 4] = [
+    (Smoothing::Off, "Off"),
+    (Smoothing::Auto, "Auto"),
+    (Smoothing::Fixed(100), "100 ms"),
+    (Smoothing::Fixed(250), "250 ms"),
+];
+
 /// Saved values ("" = the default): the bitrate as `6000`, `source` or
-/// `1.5x`, and the STUN server (`no` for none).
+/// `1.5x`, smoothing as `off`, `auto` or a delay in ms, and the STUN server
+/// (`no` for none).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdvancedValues {
     pub bitrate: String,
+    pub smoothing: String,
+    /// `on` shows the statistics panel; "" (off) is the default.
+    pub stats: String,
+    /// `tracks`: viewers get the subtitle tracks; "" (drawn in) is the default.
+    pub viewer_subtitles: String,
     pub stun: String,
 }
 
@@ -67,6 +95,9 @@ pub struct AdvancedValues {
 #[derive(Clone, Debug, Default)]
 pub struct AdvancedContext {
     pub bitrate_override: Option<String>,
+    pub smoothing_override: Option<String>,
+    pub stats_override: Option<String>,
+    pub viewer_subtitles_override: Option<String>,
     pub stun_override: Option<String>,
 }
 
@@ -76,6 +107,9 @@ pub struct AdvancedMenu {
     /// switching modes doesn't lose either.
     times: String,
     kbps: String,
+    smoothing: Smoothing,
+    stats: bool,
+    viewer_tracks: bool,
     stun: String,
     context: AdvancedContext,
     focus: AdvancedField,
@@ -98,6 +132,9 @@ impl AdvancedMenu {
             mode,
             times,
             kbps,
+            smoothing: Smoothing::parse(&values.smoothing).unwrap_or_default(),
+            stats: values.stats == "on",
+            viewer_tracks: values.viewer_subtitles == "tracks",
             stun: String::new(),
             context,
             focus: AdvancedField::Mode,
@@ -123,8 +160,22 @@ impl AdvancedMenu {
     /// the amount, anything but spaces for the STUN server. On the bitrate
     /// choice, a space picks the next option.
     fn insert_into(&mut self, f: AdvancedField, text: &str) -> bool {
-        if f == AdvancedField::Mode {
-            return text == " " && self.step_mode(1);
+        match f {
+            AdvancedField::Mode => return text == " " && self.step_mode(1),
+            AdvancedField::Smoothing => return text == " " && self.step_smoothing(1),
+            AdvancedField::Stats => {
+                if text == " " {
+                    self.stats = !self.stats;
+                }
+                return text == " ";
+            }
+            AdvancedField::ViewerSubs => {
+                if text == " " {
+                    self.viewer_tracks = !self.viewer_tracks;
+                }
+                return text == " ";
+            }
+            _ => {}
         }
         let mode = self.mode;
         let Some(value) = self.text_mut(f) else { return false };
@@ -144,6 +195,15 @@ impl AdvancedMenu {
         let all = BitrateMode::ALL;
         let i = all.iter().position(|m| *m == self.mode).unwrap_or(0) as isize;
         self.set_mode(all[(i + by).rem_euclid(all.len() as isize) as usize])
+    }
+
+    /// Move the smoothing choice by `by` (wrapping); whether it changed. A
+    /// delay set elsewhere that isn't offered counts as Auto's place.
+    fn step_smoothing(&mut self, by: isize) -> bool {
+        let n = SMOOTHING_CHOICES.len() as isize;
+        let i = SMOOTHING_CHOICES.iter().position(|(s, _)| *s == self.smoothing).unwrap_or(1) as isize;
+        let next = SMOOTHING_CHOICES[(i + by).rem_euclid(n) as usize].0;
+        std::mem::replace(&mut self.smoothing, next) != next
     }
 
     fn set_mode(&mut self, mode: BitrateMode) -> bool {
@@ -200,9 +260,22 @@ impl AdvancedMenu {
         }
     }
 
-    /// Left/Right arrows: change the bitrate choice when it has focus.
+    /// Left/Right arrows: change the focused choice.
     pub fn arrow(&mut self, by: isize) -> Action {
-        if self.focus == AdvancedField::Mode && self.step_mode(by) { self.edited() } else { Action::None }
+        let changed = match self.focus {
+            AdvancedField::Mode => self.step_mode(by),
+            AdvancedField::Smoothing => self.step_smoothing(by),
+            AdvancedField::Stats => {
+                self.stats = !self.stats;
+                true
+            }
+            AdvancedField::ViewerSubs => {
+                self.viewer_tracks = !self.viewer_tracks;
+                true
+            }
+            _ => false,
+        };
+        if changed { self.edited() } else { Action::None }
     }
 
     fn focus_step(&mut self, by: usize) -> Action {
@@ -258,7 +331,11 @@ impl AdvancedMenu {
             // "host:port" without the scheme.
             s => format!("stun:{s}"),
         };
-        Action::SaveAdvanced { values: AdvancedValues { bitrate, stun } }
+        // Auto is the default: saved as "".
+        let smoothing = if self.smoothing == Smoothing::Auto { String::new() } else { self.smoothing.to_string() };
+        let stats = if self.stats { "on".to_string() } else { String::new() };
+        let viewer_subtitles = if self.viewer_tracks { "tracks".to_string() } else { String::new() };
+        Action::SaveAdvanced { values: AdvancedValues { bitrate, smoothing, stats, viewer_subtitles, stun } }
     }
 
     pub fn click(&mut self, hit: Hit, pos: (f64, f64), l: &Layout) -> Action {
@@ -273,6 +350,9 @@ impl AdvancedMenu {
                         self.set_mode(BitrateMode::Custom);
                         self.kbps.clear();
                     }
+                    AdvancedField::Smoothing => self.smoothing = Smoothing::default(),
+                    AdvancedField::Stats => self.stats = false,
+                    AdvancedField::ViewerSubs => self.viewer_tracks = false,
                     f => {
                         if let Some(value) = self.text_mut(f) {
                             value.clear();
@@ -283,9 +363,45 @@ impl AdvancedMenu {
             }
             Hit::Field(0) => {
                 let focused = self.focus(AdvancedField::Mode);
-                let picked = segments(l.field(0)).iter().position(|s| s.contains(pos));
+                let picked = segments(l.field(0), BitrateMode::ALL.len()).iter().position(|s| s.contains(pos));
                 match picked {
                     Some(i) if self.set_mode(BitrateMode::ALL[i]) => self.edited(),
+                    _ => focused,
+                }
+            }
+            Hit::Field(2) => {
+                let field = AdvancedField::Smoothing;
+                let focused = self.focus(field);
+                let picked = segments(l.field(field.index()), SMOOTHING_CHOICES.len()).iter().position(|s| s.contains(pos));
+                match picked.map(|i| SMOOTHING_CHOICES[i].0) {
+                    Some(choice) if choice != self.smoothing => {
+                        self.smoothing = choice;
+                        self.edited()
+                    }
+                    _ => focused,
+                }
+            }
+            Hit::Field(3) => {
+                let field = AdvancedField::Stats;
+                let focused = self.focus(field);
+                let picked = segments(l.field(field.index()), 2).iter().position(|s| s.contains(pos));
+                match picked.map(|i| i == 1) {
+                    Some(on) if on != self.stats => {
+                        self.stats = on;
+                        self.edited()
+                    }
+                    _ => focused,
+                }
+            }
+            Hit::Field(4) => {
+                let field = AdvancedField::ViewerSubs;
+                let focused = self.focus(field);
+                let picked = segments(l.field(field.index()), 2).iter().position(|s| s.contains(pos));
+                match picked.map(|i| i == 1) {
+                    Some(tracks) if tracks != self.viewer_tracks => {
+                        self.viewer_tracks = tracks;
+                        self.edited()
+                    }
                     _ => focused,
                 }
             }
@@ -309,35 +425,22 @@ impl AdvancedMenu {
 
     pub fn render(&self, l: &Layout) -> String {
         let mut ass = Ass::new();
-        draw_panel(&mut ass, l, "Advanced settings", "A new bitrate applies right away; STUN when you next join.");
+        draw_panel(&mut ass, l, "Advanced settings", "These apply right away, except STUN: when you next join.");
         let mono = || TextStyle { align: 4, size: 20.0, color: TEXT, font: Some(MONO_FONT), ..Default::default() };
         let faint = |s: &str| (s.to_string(), TEXT_FAINT);
         let overridden = |v: &str| (format!("Overridden by --script-opts: {v}"), WARNING);
 
-        // The bitrate choice: three segments in a field-sized box.
+        // The bitrate choice.
         let mode = AdvancedField::Mode;
-        let rect = l.field(mode.index());
         let focused = self.focus == mode;
-        let label = TextStyle { size: 14.0, bold: true, color: TEXT_MUTED, spacing: 1.0, ..Default::default() };
-        ass.text(rect.x, rect.y - 24.0, &label, "STREAM BITRATE");
-        let ring = if focused { (2.0, ACCENT) } else { (1.0, FIELD_EDGE) };
-        ass.rect(rect, 8.0, FIELD, Some(ring), 0.0);
-        for (seg, m) in segments(rect).into_iter().zip(BitrateMode::ALL) {
-            let chosen = m == self.mode;
-            if chosen {
-                ass.rect(seg, 6.0, ACCENT, None, 0.0);
-            }
-            let color = if chosen { TEXT } else { TEXT_MUTED };
-            let (x, y) = seg.center();
-            ass.text(x, y, &TextStyle { align: 5, size: 18.0, bold: chosen, color, ..Default::default() }, m.label());
-        }
-        let (helper, color) = match &self.context.bitrate_override {
+        let labels = BitrateMode::ALL.map(BitrateMode::label);
+        let chosen = BitrateMode::ALL.iter().position(|m| *m == self.mode);
+        let helper = match &self.context.bitrate_override {
             Some(v) => overridden(v),
             None if focused => faint("←/→ or Space to choose · Tab for the next field"),
             None => faint("Click to choose"),
         };
-        let small = TextStyle { size: 15.0, color, ..Default::default() };
-        ass.text(rect.x, rect.y + rect.h + 10.0, &small, &crate::ass::escape(&helper));
+        draw_choice(&mut ass, l.field(mode.index()), "STREAM BITRATE", &labels, chosen, focused, helper);
 
         // The multiplier or bitrate.
         let amount = AdvancedField::Amount;
@@ -379,6 +482,59 @@ impl AdvancedMenu {
             },
         );
 
+        // Smoothing of streams you watch.
+        let field = AdvancedField::Smoothing;
+        let labels = SMOOTHING_CHOICES.map(|(_, label)| label);
+        let chosen = SMOOTHING_CHOICES.iter().position(|(s, _)| *s == self.smoothing);
+        let helper = match (&self.context.smoothing_override, self.smoothing) {
+            (Some(v), _) => overridden(v),
+            (None, Smoothing::Off) => faint("Frames show the moment they arrive: least delay, but network hiccups stutter."),
+            (None, Smoothing::Auto) => faint("Just enough delay to even out the network's timing, measured as you watch."),
+            (None, Smoothing::Fixed(ms)) => faint(&format!("About {ms} ms of delay, for even timing on rough connections.")),
+        };
+        draw_choice(
+            &mut ass,
+            l.field(field.index()),
+            "SMOOTH PLAYBACK (STREAMS YOU WATCH)",
+            &labels,
+            chosen,
+            self.focus == field,
+            helper,
+        );
+
+        // The statistics panel.
+        let field = AdvancedField::Stats;
+        let helper = match &self.context.stats_override {
+            Some(v) => overridden(v),
+            None => faint("Connection and timing figures, top right, shown with the member list."),
+        };
+        draw_choice(
+            &mut ass,
+            l.field(field.index()),
+            "STATISTICS PANEL",
+            &["Off", "On"],
+            Some(usize::from(self.stats)),
+            self.focus == field,
+            helper,
+        );
+
+        // How viewers get subtitles.
+        let field = AdvancedField::ViewerSubs;
+        let helper = match (&self.context.viewer_subtitles_override, self.viewer_tracks) {
+            (Some(v), _) => overridden(v),
+            (None, false) => faint("Your subtitles, drawn into the picture as you see them."),
+            (None, true) => faint("Every subtitle track goes to viewers; each picks and styles their own."),
+        };
+        draw_choice(
+            &mut ass,
+            l.field(field.index()),
+            "SUBTITLES FOR VIEWERS",
+            &["Drawn in", "As tracks"],
+            Some(usize::from(self.viewer_tracks)),
+            self.focus == field,
+            helper,
+        );
+
         let stun = AdvancedField::Stun;
         let (helper, helper_color) = match &self.context.stun_override {
             Some(v) => overridden(v),
@@ -402,19 +558,47 @@ impl AdvancedMenu {
             },
         );
 
-        draw_button(&mut ass, l.left, "Use default", ButtonKind::Secondary, self.hover == Hit::Left);
+        draw_button(&mut ass, l.left, "Use default", ButtonKind::Secondary { enabled: true }, self.hover == Hit::Left);
         draw_button(&mut ass, l.cancel, "Cancel", ButtonKind::Ghost, self.hover == Hit::Cancel);
         draw_button(&mut ass, l.primary, "Save", ButtonKind::Primary { enabled: true }, self.hover == Hit::Primary);
         ass.finish()
     }
 }
 
-/// The three segments of the bitrate choice inside its box.
-fn segments(r: Rect) -> [Rect; 3] {
+/// `n` side-by-side segments inside a choice's box.
+fn segments(r: Rect, n: usize) -> Vec<Rect> {
     const INSET: f64 = 5.0;
     const GAP: f64 = 4.0;
-    let w = (r.w - 2.0 * INSET - 2.0 * GAP) / 3.0;
-    std::array::from_fn(|i| Rect::new(r.x + INSET + i as f64 * (w + GAP), r.y + INSET, w, r.h - 2.0 * INSET))
+    let w = (r.w - 2.0 * INSET - (n - 1) as f64 * GAP) / n as f64;
+    (0..n).map(|i| Rect::new(r.x + INSET + i as f64 * (w + GAP), r.y + INSET, w, r.h - 2.0 * INSET)).collect()
+}
+
+/// A choice of options in a field-sized box (the chosen one filled), with
+/// its label above and a helper line below.
+fn draw_choice(
+    ass: &mut Ass,
+    rect: Rect,
+    label: &str,
+    options: &[&str],
+    chosen: Option<usize>,
+    focused: bool,
+    (helper, helper_color): (String, Color),
+) {
+    let label_style = TextStyle { size: 14.0, bold: true, color: TEXT_MUTED, spacing: 1.0, ..Default::default() };
+    ass.text(rect.x, rect.y - 24.0, &label_style, label);
+    let ring = if focused { (2.0, ACCENT) } else { (1.0, FIELD_EDGE) };
+    ass.rect(rect, 8.0, FIELD, Some(ring), 0.0);
+    for (i, (seg, option)) in segments(rect, options.len()).into_iter().zip(options).enumerate() {
+        let on = chosen == Some(i);
+        if on {
+            ass.rect(seg, 6.0, ACCENT, None, 0.0);
+        }
+        let color = if on { TEXT } else { TEXT_MUTED };
+        let (x, y) = seg.center();
+        ass.text(x, y, &TextStyle { align: 5, size: 18.0, bold: on, color, ..Default::default() }, &escape(option));
+    }
+    let small = TextStyle { size: 15.0, color: helper_color, ..Default::default() };
+    ass.text(rect.x, rect.y + rect.h + 10.0, &small, &escape(&helper));
 }
 
 #[cfg(test)]
@@ -426,11 +610,12 @@ mod tests {
     }
 
     fn menu(bitrate: &str, stun: &str) -> AdvancedMenu {
-        AdvancedMenu::new(&AdvancedValues { bitrate: bitrate.into(), stun: stun.into() }, AdvancedContext::default())
+        let values = AdvancedValues { bitrate: bitrate.into(), stun: stun.into(), ..Default::default() };
+        AdvancedMenu::new(&values, AdvancedContext::default())
     }
 
     fn saved(bitrate: &str, stun: &str) -> Action {
-        Action::SaveAdvanced { values: AdvancedValues { bitrate: bitrate.into(), stun: stun.into() } }
+        Action::SaveAdvanced { values: AdvancedValues { bitrate: bitrate.into(), stun: stun.into(), ..Default::default() } }
     }
 
     #[test]
@@ -448,7 +633,7 @@ mod tests {
         assert_eq!(m.insert(" "), Action::Redraw, "space cycles");
         assert_eq!(m.mode, BitrateMode::Source);
         assert_eq!(m.focus_next(), Action::Redraw);
-        assert_eq!(m.focus, AdvancedField::Stun, "no amount to type when matching the source");
+        assert_eq!(m.focus, AdvancedField::Smoothing, "no amount to type when matching the source");
         m.focus_prev();
         assert_eq!(m.arrow(1), Action::Redraw);
         assert_eq!(m.mode, BitrateMode::Times);
@@ -489,7 +674,7 @@ mod tests {
     fn clicks_pick_segments_and_buttons() {
         let l = layout();
         let mut m = menu("", "");
-        let segs = segments(l.field(0));
+        let segs = segments(l.field(0), 3);
         let pos = segs[0].center();
         assert_eq!(m.click(l.hit(pos), pos, &l), Action::Redraw);
         assert_eq!(m.mode, BitrateMode::Source);
@@ -505,8 +690,64 @@ mod tests {
     }
 
     #[test]
+    fn smoothing_choices() {
+        let l = layout();
+        let mut m = menu("", "");
+        assert_eq!(m.smoothing, Smoothing::Auto, "the default");
+        let segs = segments(l.field(2), 4);
+        let pos = segs[0].center();
+        assert_eq!(m.click(l.hit(pos), pos, &l), Action::Redraw);
+        let off = Action::SaveAdvanced {
+            values: AdvancedValues { smoothing: "off".into(), ..Default::default() },
+        };
+        assert_eq!(m.submit(), off);
+        assert_eq!(m.focus, AdvancedField::Smoothing);
+        m.arrow(1);
+        m.arrow(1);
+        let fixed = Action::SaveAdvanced {
+            values: AdvancedValues { smoothing: "100".into(), ..Default::default() },
+        };
+        assert_eq!(m.submit(), fixed);
+        m.arrow(-1);
+        assert_eq!(m.submit(), saved("", ""), "Auto saves as the default");
+        let values = AdvancedValues { smoothing: "250".into(), ..Default::default() };
+        let ass = AdvancedMenu::new(&values, AdvancedContext::default()).render(&l);
+        assert!(ass.contains("About 250 ms of delay"));
+    }
+
+    #[test]
+    fn statistics_toggle() {
+        let l = layout();
+        let mut m = menu("", "");
+        let pos = segments(l.field(3), 2)[1].center();
+        assert_eq!(m.click(l.hit(pos), pos, &l), Action::Redraw);
+        let on = Action::SaveAdvanced { values: AdvancedValues { stats: "on".into(), ..Default::default() } };
+        assert_eq!(m.submit(), on);
+        m.arrow(1);
+        assert_eq!(m.submit(), saved("", ""), "off is the default");
+    }
+
+    #[test]
+    fn viewer_subtitles_toggle() {
+        let l = layout();
+        let mut m = menu("", "");
+        let pos = segments(l.field(4), 2)[1].center();
+        assert_eq!(m.click(l.hit(pos), pos, &l), Action::Redraw);
+        let tracks = Action::SaveAdvanced { values: AdvancedValues { viewer_subtitles: "tracks".into(), ..Default::default() } };
+        assert_eq!(m.submit(), tracks);
+        m.arrow(1);
+        assert_eq!(m.submit(), saved("", ""), "drawn in is the default");
+    }
+
+    #[test]
     fn shows_overrides() {
-        let context = AdvancedContext { bitrate_override: Some("source".into()), stun_override: Some("no".into()) };
+        let context = AdvancedContext {
+            bitrate_override: Some("source".into()),
+            smoothing_override: None,
+            stats_override: None,
+            viewer_subtitles_override: None,
+            stun_override: Some("no".into()),
+        };
         let ass = AdvancedMenu::new(&AdvancedValues::default(), context).render(&layout());
         assert!(ass.contains("Overridden by --script-opts: source"));
         assert!(ass.contains("Overridden by --script-opts: no"));

@@ -42,7 +42,7 @@ Or try it without installing:
 mpv --idle=yes --force-window=yes --script=C:\path\to\mpvlink.dll
 ```
 
-Everything works as on macOS: `Ctrl+j` opens the menu, `Ctrl+,` opens
+Everything works as on macOS: `Ctrl+j` (or `Space` on the start screen) opens the menu, `Ctrl+,` opens
 Settings, and `Ctrl+V` pastes. Your display name and server setting are saved in
 `%LOCALAPPDATA%\mpv\mpvlink\profile`.
 

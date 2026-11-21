@@ -5,13 +5,17 @@ mpv plugin for streaming video to friends over WebRTC. Pick a display name,
 create or join a room with a code, and anyone in the room can stream what their 
 mpv is playing while the others watch it live.
 
-- **Low latency:** video is shown the moment it arrives. On a local network
-  viewers trail the streamer by one or two frames.
+- **Low latency:** on a local network viewers trail the streamer by one or two
+  frames. Over the internet, a small automatic buffer evens out the network's
+  timing so motion stays smooth (adjustable, or off for the lowest delay).
 - **Several streamers per room:** a member list shows who's streaming; click a
   name to switch to their stream.
 - **Stream what you're watching:** with yourself selected, drag a video into
   mpv. Pausing, seeking and speed changes carry over to your viewers, along
   with audio and subtitles.
+- **AniList tracking:** sign in, and episodes you watch, on your own or in a
+  room, are added to your list automatically, like Taiga
+  ([docs/tracking.md](docs/tracking.md)).
 - **macOS, Linux and Windows.**
 
 ## How it works
@@ -56,7 +60,8 @@ server address (e.g. `wss://signal.example.com`) and save.
 
 ### 3. Join a room
 
-Press `Ctrl+j`, enter a display name, then either type a room code and press
+Press `Ctrl+j` (or `Space` on mpv's start screen, where a line says so), enter
+a display name, then either type a room code and press
 **Join**, or click **Create room** (the new code is copied to your clipboard
 to share).
 
@@ -65,10 +70,14 @@ to share).
 | Key | Action |
 |---|---|
 | `Ctrl+j` | Open or close the menu |
+| `Space` | Open the menu, on mpv's start screen when you're not in a room |
+| `Ctrl+a` | Change the AniList match of what's playing ([tracking](docs/tracking.md)) |
+| `Ctrl+z` | Undo an AniList update, for 10 seconds after it |
 | `Ctrl+,` | Settings (in the menu) |
 
-For your own `input.conf`: `script-binding mpvlink/toggle-menu` and
-`script-binding mpvlink/settings`.
+For your own `input.conf`: `script-binding mpvlink/toggle-menu`,
+`script-binding mpvlink/settings`, and `script-binding mpvlink/toggle-stats`
+(shows or hides the statistics panel until mpv restarts).
 
 ### Options
 
@@ -81,6 +90,8 @@ what's saved there:
 | `mpvlink-server=wss://host` | Signaling server (default: `ws://127.0.0.1:8787`) |
 | `mpvlink-ffmpeg=/path/to/ffmpeg` | ffmpeg for streaming (default: found automatically) |
 | `mpvlink-kbps=6000` | Bitrate of your stream: kbit/s, `source` (match the video) or e.g. `1.5x` (times the video's); default 6000 |
+| `mpvlink-stats=yes` | Show the statistics panel (a debugging aid) |
+| `mpvlink-smoothing=auto` | Smooth playback of streams you watch: `off`, `auto`, or a delay in ms |
 | `mpvlink-stun=stun:host:port` | STUN server, or `no` for none (default: Google's public one) |
 
 ## Limitations
@@ -88,8 +99,9 @@ what's saved there:
 - No TURN relay yet, so two people behind strict NATs or firewalls may not be
   able to connect directly (the signaling works, but no video arrives).
 - Streams are H.264 up to 1080p; HDR is converted without tone mapping.
-- Subtitles are burned into the video, with your mpv subtitle delay and style
-  settings (viewers can't turn them off).
+- Subtitles are drawn into the video by default, with your mpv subtitle delay
+  and style settings; or viewers get every subtitle track to choose from
+  (Settings → Advanced).
 - Only files and `http(s)://` links can be streamed, not YouTube links, and
   not window or screen capture (planned).
 

@@ -60,6 +60,8 @@ pub enum PeerEvent {
     GatheringComplete,
     State(RTCPeerConnectionState),
     Track(Arc<dyn TrackRemote>),
+    /// The other side opened a data channel.
+    DataChannel(Arc<dyn webrtc::data_channel::DataChannel>),
 }
 
 struct Forwarder(mpsc::UnboundedSender<PeerEvent>);
@@ -78,6 +80,10 @@ impl PeerConnectionEventHandler for Forwarder {
 
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
         let _ = self.0.send(PeerEvent::Track(track));
+    }
+
+    async fn on_data_channel(&self, channel: Arc<dyn webrtc::data_channel::DataChannel>) {
+        let _ = self.0.send(PeerEvent::DataChannel(channel));
     }
 }
 

@@ -115,7 +115,7 @@ impl State {
         {
             let peers = others(members, id);
             let member = members.get_mut(&id).expect("found above");
-            let _ = outbox.send(ServerMsg::Welcome { you: id, peers, resumed: true });
+            let _ = outbox.send(ServerMsg::Welcome { you: id, peers, resumed: true, features: features() });
             if let Link::Away(queue) = std::mem::replace(&mut member.link, Link::Connected(outbox.clone())) {
                 for msg in queue {
                     let _ = outbox.send(msg);
@@ -126,7 +126,12 @@ impl State {
         }
 
         let info = PeerInfo { id: new_id, name, streaming };
-        let _ = outbox.send(ServerMsg::Welcome { you: new_id, peers: others(members, new_id), resumed: false });
+        let _ = outbox.send(ServerMsg::Welcome {
+            you: new_id,
+            peers: others(members, new_id),
+            resumed: false,
+            features: features(),
+        });
         for m in members.values_mut() {
             m.send(ServerMsg::PeerJoined { peer: info.clone() });
         }
@@ -226,6 +231,16 @@ async fn main() -> Result<()> {
     }
 }
 
+/// What this server relays beyond the basics (sent in `Welcome`).
+fn features() -> Vec<String> {
+    vec![mpvlink_proto::FEATURE_NOW_PLAYING.to_string()]
+}
+
+/// Whether a message is a `signal` (by its type tag).
+fn is_signal(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text).is_ok_and(|v| v["type"] == "signal")
+}
+
 fn parse_args() -> Result<String> {
     let mut listen = "0.0.0.0:8787".to_string();
     let mut args = std::env::args().skip(1);
@@ -292,6 +307,12 @@ async fn handle(stream: TcpStream, addr: SocketAddr, conn: ConnId, state: Arc<Mu
         };
         let msg: ClientMsg = match serde_json::from_str(&text) {
             Ok(msg) => msg,
+            // A kind of signal this server doesn't know (from a newer
+            // client): skip it rather than dropping the client.
+            Err(e) if is_signal(&text) => {
+                println!("{}: ignoring an unknown signal: {e}", tag(&joined));
+                continue;
+            }
             Err(e) => {
                 let _ = outbox.send(ServerMsg::Error { message: format!("bad message: {e}") });
                 break;
@@ -371,6 +392,14 @@ async fn handle(stream: TcpStream, addr: SocketAddr, conn: ConnId, state: Arc<Mu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_signals_are_recognized_as_signals() {
+        // A newer client's signal kind: skipped, not a reason to disconnect.
+        assert!(is_signal(r#"{"type":"signal","to":2,"signal":{"kind":"from_the_future"}}"#));
+        assert!(!is_signal(r#"{"type":"bogus"}"#));
+        assert!(!is_signal("not json"));
+    }
+
     use super::*;
 
     struct Client {
@@ -406,9 +435,9 @@ mod tests {
         let (mut p, mut v, mut p2) = (client(), client(), client());
 
         join(&mut s, &p, 1, true, None).unwrap();
-        assert_eq!(p.next(), ServerMsg::Welcome { you: 1, peers: vec![], resumed: false });
+        assert_eq!(p.next(), ServerMsg::Welcome { you: 1, peers: vec![], resumed: false, features: features() });
         join(&mut s, &v, 2, false, None).unwrap();
-        assert_eq!(v.next(), ServerMsg::Welcome { you: 2, peers: vec![info(1, true)], resumed: false });
+        assert_eq!(v.next(), ServerMsg::Welcome { you: 2, peers: vec![info(1, true)], resumed: false, features: features() });
         assert_eq!(p.next(), ServerMsg::PeerJoined { peer: info(2, false) });
 
         // Several people can stream at once.
@@ -459,7 +488,7 @@ mod tests {
         let mut v2 = client();
         let joined = s.join("ROOM", ("p2".into(), false, Some("vtoken".into())), 7, v2.tx.clone());
         assert_eq!(joined, Ok(Joined { id: 2, resumed: true }));
-        assert_eq!(v2.next(), ServerMsg::Welcome { you: 2, peers: vec![info(1, true)], resumed: true });
+        assert_eq!(v2.next(), ServerMsg::Welcome { you: 2, peers: vec![info(1, true)], resumed: true, features: features() });
         assert_eq!(v2.next(), ServerMsg::PeerLeft { id: 42 }, "queued message delivered after the welcome");
         assert!(p.idle(), "publisher never saw the viewer leave or rejoin");
 

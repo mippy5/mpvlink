@@ -7,9 +7,11 @@
 
 mod advanced;
 mod join;
+mod picker;
 mod settings;
 
 pub use advanced::{AdvancedContext, AdvancedMenu, AdvancedValues};
+pub use picker::PickerMenu;
 pub use join::JoinMenu;
 pub use settings::{SettingsContext, SettingsField, SettingsMenu, SettingsValues};
 
@@ -65,12 +67,18 @@ pub enum Action {
     CloseSettings,
     /// Save settings and go back. Empty values mean "use the default".
     SaveSettings { values: SettingsValues },
+    /// Open AniList's page for getting a sign-in code (in the browser).
+    OpenAniList,
     /// Switch from settings to the advanced page.
     OpenAdvanced,
     /// Back to the settings page without saving.
     CloseAdvanced,
     /// Save the advanced settings and go back to the settings page.
     SaveAdvanced { values: AdvancedValues },
+    /// Match picker: search AniList for `query`.
+    SearchShows { query: String },
+    /// Match picker: what's playing is this show (None: don't track it).
+    PickShow { media_id: Option<u32> },
 }
 
 // ---- Layout -----------------------------------------------------------------
@@ -121,17 +129,17 @@ impl Layout {
     /// Build a layout with `fields` text fields for an OSD of `osd_w` x `osd_h` real pixels.
     pub fn new(osd_w: f64, osd_h: f64, fields: usize) -> Self {
         let (osd_w, osd_h) = if osd_w > 0.0 && osd_h > 0.0 { (osd_w, osd_h) } else { (1280.0, 720.0) };
-        // 720 virtual pixels tall, but grow the virtual canvas on narrow windows
-        // so the panel (plus a margin) always fits horizontally.
-        let res_y = 720.0_f64.max((Self::PANEL_W + 64.0) * osd_h / osd_w).round();
-        let res_x = (res_y * osd_w / osd_h).round();
-
         let panel_h = Self::FIRST_FIELD_Y
             + Self::FIELD_PITCH * fields.saturating_sub(1) as f64
             + Self::FIELD_H
             + Self::FIELD_TO_BUTTONS
             + Self::BUTTON_H
             + Self::PAD;
+        // 720 virtual pixels tall, but grow the virtual canvas (shrinking
+        // everything a little) so the panel, plus a margin, always fits: on
+        // narrow windows, and for pages with many fields.
+        let res_y = 720.0_f64.max((Self::PANEL_W + 64.0) * osd_h / osd_w).max(panel_h + 40.0).round();
+        let res_x = (res_y * osd_w / osd_h).round();
         let panel = Rect::new(
             ((res_x - Self::PANEL_W) / 2.0).round(),
             ((res_y - panel_h) / 2.0).round(),
@@ -286,8 +294,11 @@ fn draw_field(ass: &mut Ass, rect: Rect, f: &FieldView) {
 enum ButtonKind {
     /// Filled accent color; dimmed when disabled.
     Primary { enabled: bool },
-    /// Filled gray.
-    Secondary,
+    /// Filled gray; dimmed when disabled.
+    Secondary { enabled: bool },
+    /// Outlined, so it reads as a button where a filled one would be too
+    /// loud (the small Settings / Advanced buttons at the top).
+    Outline,
     /// Text only; background on hover.
     Ghost,
 }
@@ -296,11 +307,14 @@ fn draw_button(ass: &mut Ass, rect: Rect, label: &str, kind: ButtonKind, hovered
     let (fill, text) = match kind {
         ButtonKind::Primary { enabled: false } => (Some(ACCENT_DISABLED), TEXT.with_opacity(140)),
         ButtonKind::Primary { enabled: true } => (Some(if hovered { ACCENT_HOVER } else { ACCENT }), TEXT),
-        ButtonKind::Secondary => (Some(if hovered { SECONDARY_HOVER } else { SECONDARY }), TEXT),
+        ButtonKind::Secondary { enabled: false } => (Some(SECONDARY.with_opacity(110)), TEXT.with_opacity(140)),
+        ButtonKind::Secondary { enabled: true } => (Some(if hovered { SECONDARY_HOVER } else { SECONDARY }), TEXT),
+        ButtonKind::Outline => (Some(if hovered { GHOST_HOVER } else { PANEL }), TEXT),
         ButtonKind::Ghost => (hovered.then_some(GHOST_HOVER), TEXT),
     };
+    let outline = (kind == ButtonKind::Outline).then_some((1.5, SECONDARY_HOVER));
     if let Some(fill) = fill {
-        ass.rect(rect, 8.0, fill, None, 0.0);
+        ass.rect(rect, 8.0, fill, outline, 0.0);
     }
     let (x, y) = rect.center();
     ass.text(x, y, &TextStyle { align: 5, size: 18.0, bold: true, color: text, ..Default::default() }, label);
@@ -315,22 +329,47 @@ pub struct Menu {
     join: JoinMenu,
     settings: Option<SettingsMenu>,
     advanced: Option<AdvancedMenu>,
+    /// The AniList match picker: opened on its own (from playback), on top
+    /// of everything while it's open.
+    picker: Option<PickerMenu>,
 }
 
 /// Forward a call to whichever page is showing.
 macro_rules! page {
     ($self:ident.$method:ident($($arg:expr),*)) => {
-        match (&mut $self.advanced, &mut $self.settings) {
-            (Some(advanced), _) => advanced.$method($($arg),*),
-            (None, Some(settings)) => settings.$method($($arg),*),
-            (None, None) => $self.join.$method($($arg),*),
+        match (&mut $self.picker, &mut $self.advanced, &mut $self.settings) {
+            (Some(picker), _, _) => picker.$method($($arg),*),
+            (None, Some(advanced), _) => advanced.$method($($arg),*),
+            (None, None, Some(settings)) => settings.$method($($arg),*),
+            (None, None, None) => $self.join.$method($($arg),*),
         }
     };
 }
 
 impl Menu {
-    pub fn new(name: &str) -> Self {
-        Self { join: JoinMenu::new(name), settings: None, advanced: None }
+    /// `needs_server`: no signaling server is set yet, so joining waits
+    /// until one is (the join page sends people to Settings).
+    pub fn new(name: &str, needs_server: bool) -> Self {
+        Self { join: JoinMenu::new(name, needs_server), settings: None, advanced: None, picker: None }
+    }
+
+    /// Show the AniList match picker; the search it opens with.
+    pub fn open_picker(&mut self, mut picker: PickerMenu) -> Action {
+        let search = picker.first_search();
+        self.picker = Some(picker);
+        search
+    }
+
+    /// Search results for the picker.
+    pub fn set_results(&mut self, query: &str, results: Vec<crate::tracking::Choice>) {
+        if let Some(p) = self.picker.as_mut() {
+            p.set_results(query, results);
+        }
+    }
+
+    /// A signaling server was saved (or cleared).
+    pub fn set_needs_server(&mut self, needs: bool) {
+        self.join.set_needs_server(needs);
     }
 
     /// The display name as typed so far (untrimmed).
@@ -373,6 +412,9 @@ impl Menu {
 
     /// Text fields on the current page, for the layout.
     pub fn field_count(&self) -> usize {
+        if self.picker.is_some() {
+            return PickerMenu::FIELDS;
+        }
         match (&self.advanced, &self.settings) {
             (Some(_), _) => AdvancedMenu::FIELDS,
             (None, Some(_)) => SettingsMenu::FIELDS,
@@ -408,11 +450,23 @@ impl Menu {
     /// Left (-1) or Right (+1) arrow: only the advanced page's bitrate
     /// choice uses them.
     pub fn arrow(&mut self, by: isize) -> Action {
+        if self.picker.is_some() {
+            return Action::None;
+        }
         self.advanced.as_mut().map_or(Action::None, |a| a.arrow(by))
     }
 
-    /// Esc: back out of the advanced page or settings, or close the menu.
+    /// Up (-1) or Down (+1) arrow: the picker's results.
+    pub fn vertical(&mut self, by: isize) -> Action {
+        self.picker.as_mut().map_or(Action::None, |p| p.move_selection(by))
+    }
+
+    /// Esc: back out of the advanced page or settings, or close the menu
+    /// (the picker was opened on its own, so it closes the menu).
     pub fn escape(&mut self) -> Action {
+        if self.picker.is_some() {
+            return Action::Close;
+        }
         match (&self.advanced, &self.settings) {
             (Some(_), _) => Action::CloseAdvanced,
             (None, Some(_)) => Action::CloseSettings,
@@ -422,6 +476,9 @@ impl Menu {
 
     pub fn click(&mut self, pos: (f64, f64), layout: &Layout) -> Action {
         let hit = layout.hit(pos);
+        if let Some(picker) = self.picker.as_mut() {
+            return picker.click(hit, pos, layout);
+        }
         match (&mut self.advanced, &mut self.settings) {
             (Some(advanced), _) => advanced.click(hit, pos, layout),
             (None, Some(settings)) => settings.click(hit),
@@ -431,10 +488,20 @@ impl Menu {
 
     pub fn mouse_move(&mut self, pos: Option<(f64, f64)>, layout: &Layout) -> Action {
         let hit = pos.map_or(Hit::None, |p| layout.hit(p));
-        page!(self.hover(hit))
+        if let Some(picker) = self.picker.as_mut() {
+            return picker.hover(hit, pos, layout);
+        }
+        match (&mut self.advanced, &mut self.settings) {
+            (Some(advanced), _) => advanced.hover(hit),
+            (None, Some(settings)) => settings.hover(hit),
+            (None, None) => self.join.hover(hit),
+        }
     }
 
     fn caret(&self) -> &Caret {
+        if let Some(p) = &self.picker {
+            return &p.caret;
+        }
         match (&self.advanced, &self.settings) {
             (Some(a), _) => &a.caret,
             (None, Some(s)) => &s.caret,
@@ -451,6 +518,9 @@ impl Menu {
     }
 
     pub fn render(&self, layout: &Layout) -> String {
+        if let Some(p) = &self.picker {
+            return p.render(layout);
+        }
         match (&self.advanced, &self.settings) {
             (Some(a), _) => a.render(layout),
             (None, Some(s)) => s.render(layout),
@@ -465,7 +535,7 @@ mod tests {
 
     #[test]
     fn layout_fits_narrow_windows() {
-        for fields in [1, 2, 3] {
+        for fields in [1, 2, 3, 4, 5, 6] {
             let l = Layout::new(400.0, 900.0, fields);
             assert!(l.panel.x >= 0.0 && l.panel.x + l.panel.w <= l.res_x as f64);
             assert!(l.panel.y >= 0.0 && l.panel.y + l.panel.h <= l.res_y as f64);
@@ -474,7 +544,7 @@ mod tests {
 
     #[test]
     fn layout_keeps_fields_above_buttons_and_buttons_apart() {
-        for fields in [1, 2, 3] {
+        for fields in [1, 2, 3, 4, 5, 6] {
             let l = Layout::new(1280.0, 720.0, fields);
             let last = l.field(fields - 1);
             // Field + its message line must end before the buttons start.
@@ -486,15 +556,15 @@ mod tests {
 
     #[test]
     fn settings_page_round_trip_keeps_join_fields() {
-        let mut m = Menu::new("Ana");
+        let mut m = Menu::new("Ana", false);
         m.insert("room1");
         assert_eq!(m.field_count(), 2);
-        let values = SettingsValues { server: "wss://old.example".into(), ffmpeg: String::new() };
+        let values = SettingsValues { server: "wss://old.example".into(), ..Default::default() };
         m.open_settings(&values, SettingsContext { ffmpeg_found: Err(String::new()), ..Default::default() });
-        assert_eq!(m.field_count(), 2);
+        assert_eq!(m.field_count(), 3);
         m.insert("/x"); // goes to the settings field, not the room code
         m.open_advanced(&AdvancedValues::default(), AdvancedContext::default());
-        assert_eq!(m.field_count(), 3);
+        assert_eq!(m.field_count(), 6);
         assert_eq!(m.escape(), Action::CloseAdvanced);
         m.close_advanced();
         assert_eq!(m.escape(), Action::CloseSettings);
